@@ -70,11 +70,26 @@ try {
         break;
     case 'set-fault':
         $flag = isset($argv[2]) ? (string) $argv[2] : 'off';
-        if ($flag === 'off')
-            $flag = '';
-        if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail')
-            bridge_fail('Fault must be after_reply, note_fail, or off.');
-        bridge_out(bridge_config(array('test_fault' => $flag)));
+        bridge_out(bridge_fault_constant($flag));
+        break;
+    case 'clear-fault-config':
+        bridge_out(bridge_fault_config(null));
+        break;
+    case 'plant-fault-config':
+        $value = isset($argv[2]) ? (string) $argv[2] : '';
+        if ($value === '')
+            bridge_fail('A config value is required.');
+        bridge_out(bridge_fault_config($value));
+        break;
+    case 'ui-reply':
+        $text = implode(' ', array_slice($argv, 4));
+        bridge_out(bridge_ui_reply($argv[2], $argv[3], $text));
+        break;
+    case 'reply-template':
+        bridge_out(bridge_reply_template($argv[2]));
+        break;
+    case 'set-reply-template':
+        bridge_out(bridge_write_reply_template($argv[2]));
         break;
     case 'set-max':
         $max = isset($argv[2]) ? (int) $argv[2] : 0;
@@ -166,7 +181,6 @@ function bridge_install($cidr) {
             'allowed_ips' => $cidr,
             'enabled' => 1,
             'max_body_bytes' => '8388608',
-            'test_fault' => '',
         );
         $inst = $impl->addInstance($vars, $errors);
         if (!$inst)
@@ -188,7 +202,6 @@ function bridge_install($cidr) {
                 'allowed_ips' => $cidr,
                 'enabled' => 1,
                 'max_body_bytes' => (string) ($inst->getConfig()->get('max_body_bytes') ?: '8388608'),
-                'test_fault' => (string) $inst->getConfig()->get('test_fault'),
             );
             if (!$inst->update($vars, $errors))
                 bridge_fail('Could not update the plugin instance.', array('errors' => $errors));
@@ -389,10 +402,17 @@ function bridge_fixtures() {
     $faultReply = $take($buckets['any']);
     $faultNote = $take($buckets['any']);
     $owner = $take($buckets['any']);
+    $beforeReply = $take($buckets['any']);
+    $twoNotes = $take($buckets['any']);
+    $bodyHash = $take($buckets['any']);
+    $due = $take($buckets['close']);
+    $planted = $take($buckets['any']);
     if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale
-            || !$race || !$faultReply || !$faultNote || !$owner)
+            || !$race || !$faultReply || !$faultNote || !$owner
+            || !$beforeReply || !$twoNotes || !$bodyHash || !$due || !$planted)
         bridge_fail('Not enough distinct tickets for the reply staff.', array(
             'any' => count($buckets['any']),
+            'close' => count($buckets['close']),
         ));
 
     $noAccessStaff = null;
@@ -459,6 +479,11 @@ function bridge_fixtures() {
             'fault_reply' => bridge_brief($faultReply),
             'fault_note' => bridge_brief($faultNote),
             'owner' => bridge_brief($owner),
+            'before_reply' => bridge_brief($beforeReply),
+            'two_notes' => bridge_brief($twoNotes),
+            'body_hash' => bridge_brief($bodyHash),
+            'due_date' => bridge_brief($due),
+            'planted' => bridge_brief($planted),
             'no_access' => bridge_brief($noAccessTicket),
             'no_reply' => bridge_brief($noReplyTicket),
         ),
@@ -632,7 +657,6 @@ function bridge_config($changes) {
         'allowed_ips' => (string) $cfg->get('allowed_ips'),
         'enabled' => $cfg->get('enabled') ? 1 : 0,
         'max_body_bytes' => (string) ($cfg->get('max_body_bytes') ?: '8388608'),
-        'test_fault' => (string) $cfg->get('test_fault'),
     );
     foreach ($changes as $key => $value) {
         if (!array_key_exists($key, $vars) || $key === 'shared_secret')
@@ -718,7 +742,7 @@ function bridge_ledger($requestId) {
     if (!preg_match('/^[A-Za-z0-9-]{36}$/', (string) $requestId))
         bridge_fail('request id is not valid.');
     $sql = 'SELECT status, ticket_id, staff_id, response_entry_id, note_entry_id,'
-        . ' baseline_entry_id FROM `' . TABLE_PREFIX . 'wgs_reply_ledger`'
+        . ' native_returned, baseline_entry_id FROM `' . TABLE_PREFIX . 'wgs_reply_ledger`'
         . ' WHERE request_id=' . db_input($requestId);
     if (!($res = db_query($sql)) || !db_num_rows($res))
         return array('ok' => true, 'found' => false);
@@ -731,6 +755,163 @@ function bridge_ledger($requestId) {
         'staff_id' => (int) $row['staff_id'],
         'response_entry_id' => $row['response_entry_id'] ? (int) $row['response_entry_id'] : null,
         'note_entry_id' => $row['note_entry_id'] ? (int) $row['note_entry_id'] : null,
+        'native_returned' => !empty($row['native_returned']) ? 1 : 0,
         'baseline_entry_id' => $row['baseline_entry_id'] !== null ? (int) $row['baseline_entry_id'] : null,
+    );
+}
+
+/**
+ * The fault is a PHP constant in the staging ost-config.php. It is not a
+ * plugin setting. The file holds the database password, so this rewrites
+ * only a marked block and never prints the file. Apache revalidates the
+ * script after a few seconds (opcache.validate_timestamps is on).
+ */
+function bridge_fault_constant($flag) {
+    if ($flag === 'off')
+        $flag = '';
+    if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail' && $flag !== 'before_reply')
+        bridge_fail('Fault must be after_reply, note_fail, before_reply, or off.');
+
+    $path = '/var/www/html/include/ost-config.php';
+    $raw = file_get_contents($path);
+    if ($raw === false)
+        bridge_fail('Could not read the staging config.');
+
+    $begin = '/* WGS_REPLY_BRIDGE_TEST_FAULTS */';
+    $end = '/* /WGS_REPLY_BRIDGE_TEST_FAULTS */';
+    $inner = $begin . "\n";
+    if ($flag !== '')
+        $inner .= "define('WGS_REPLY_BRIDGE_TEST_FAULTS', " . var_export($flag, true) . ");\n";
+    $inner .= $end;
+    $pattern = '/' . preg_quote($begin, '/') . '.*?' . preg_quote($end, '/') . '/s';
+    if (preg_match($pattern, $raw))
+        $next = preg_replace($pattern, $inner, $raw, 1);
+    else
+        $next = rtrim($raw) . "\n<?php\n" . $inner . "\n";
+
+    $tmp = tempnam(sys_get_temp_dir(), 'wgsfault');
+    if ($tmp === false || file_put_contents($tmp, $next) === false)
+        bridge_fail('Could not stage the fault constant.');
+    $lint = array();
+    $code = 0;
+    exec('php -l ' . escapeshellarg($tmp) . ' 2>&1', $lint, $code);
+    if ($code !== 0) {
+        unlink($tmp);
+        bridge_fail('Refusing to write the staging config because the syntax check failed.');
+    }
+    if (!copy($tmp, $path)) {
+        unlink($tmp);
+        bridge_fail('Could not update the fault constant.');
+    }
+    unlink($tmp);
+    // revalidate_freq is 2s and file_update_protection is 2s.
+    sleep(4);
+    return array('ok' => true, 'fault' => ($flag === '' ? 'off' : $flag));
+}
+
+/**
+ * Plant or delete a test_fault row in plugin config. The bridge must
+ * ignore it. null deletes. The value is not a secret.
+ */
+function bridge_fault_config($value) {
+    $inst = bridge_instance();
+    $ns = $inst->getNamespace();
+    db_query('DELETE FROM ' . CONFIG_TABLE . ' WHERE namespace=' . db_input($ns)
+        . ' AND `key`=' . db_input('test_fault'));
+    if ($value !== null) {
+        $sql = 'INSERT INTO ' . CONFIG_TABLE . ' (namespace, `key`, value) VALUES ('
+            . db_input($ns) . ',' . db_input('test_fault') . ',' . db_input($value) . ')';
+        if (!db_query($sql))
+            bridge_fail('Could not plant the config row.');
+    }
+    $stored = null;
+    $res = db_query('SELECT value FROM ' . CONFIG_TABLE . ' WHERE namespace=' . db_input($ns)
+        . ' AND `key`=' . db_input('test_fault'));
+    if ($res && ($row = db_fetch_array($res)) && isset($row['value']))
+        $stored = (string) $row['value'];
+    return array(
+        'ok' => true,
+        'value' => $stored,
+    );
+}
+
+function bridge_ui_reply($number, $username, $text) {
+    global $thisstaff;
+    if (trim($text) === '')
+        bridge_fail('Reply text is required.');
+    $staff = bridge_staff($username);
+    $thisstaff = $staff;
+    $ticket = bridge_ticket($number);
+    $clean = ThreadEntryBody::clean($text);
+    if (!$clean)
+        bridge_fail('Reply text is empty after clean.');
+    $errors = array();
+    // alert false: the entry is a real staff postReply, and this probe
+    // does not need a second customer email.
+    $response = $ticket->postReply(array(
+        'response' => $clean,
+        'reply-to' => 'user',
+        'reply_status_id' => (int) $ticket->getStatusId(),
+        'signature' => 'none',
+    ), $errors, false);
+    if (!$response || !$response->getId())
+        bridge_fail('postReply returned nothing.', array('errors' => $errors));
+    return array(
+        'ok' => true,
+        'response_entry_id' => (int) $response->getId(),
+        'type' => (string) $response->getType(),
+        'staff_id' => (int) $response->getStaffId(),
+    );
+}
+
+function bridge_reply_template_row($number) {
+    $ticket = bridge_ticket($number);
+    $dept = $ticket->getDept();
+    $tpl = $dept ? $dept->getTemplate() : null;
+    $msg = $tpl ? $tpl->getReplyMsgTemplate() : null;
+    if (!$msg)
+        bridge_fail('This department has no ticket.reply template.');
+    return $msg;
+}
+
+function bridge_reply_template($number) {
+    $msg = bridge_reply_template_row($number);
+    return array(
+        'ok' => true,
+        'id' => (int) $msg->getId(),
+        'subject' => (string) $msg->getSubject(),
+        'body' => (string) $msg->getBody(),
+    );
+}
+
+/**
+ * Writes the subject and body from stdin JSON. Direct SQL so a later
+ * restore puts the original bytes back. Format::sanitize is not run.
+ */
+function bridge_write_reply_template($number) {
+    $raw = stream_get_contents(STDIN);
+    $in = json_decode((string) $raw, true);
+    if (!is_array($in) || !isset($in['subject']) || !isset($in['body'])
+            || !is_string($in['subject']) || !is_string($in['body']))
+        bridge_fail('stdin must be a JSON object with subject and body.');
+    if ($in['subject'] === '' || $in['body'] === '')
+        bridge_fail('subject and body are required.');
+    $msg = bridge_reply_template_row($number);
+    $sql = 'UPDATE ' . EMAIL_TEMPLATE_TABLE
+        . ' SET subject=' . db_input($in['subject'])
+        . ', body=' . db_input($in['body'])
+        . ' WHERE id=' . db_input((int) $msg->getId());
+    if (!db_query($sql))
+        bridge_fail('Could not update the reply template.');
+    $id = (int) $msg->getId();
+    $res = db_query('SELECT subject, body FROM ' . EMAIL_TEMPLATE_TABLE . ' WHERE id=' . db_input($id));
+    $row = ($res) ? db_fetch_array($res) : null;
+    if (!$row)
+        bridge_fail('The reply template row was not readable after the update.');
+    return array(
+        'ok' => true,
+        'id' => $id,
+        'subject' => (string) $row['subject'],
+        'body' => (string) $row['body'],
     );
 }

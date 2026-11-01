@@ -33,9 +33,10 @@ def say(line):
     print(line, flush=True)
 
 
-def ctl(args, secret=False):
+def ctl(args, secret=False, stdin=None):
     proc = subprocess.run(
         ["docker", "exec", "-i", "osticket_staging_web", "php", CTL, *args],
+        input=stdin,
         capture_output=True, text=True,
     )
     if secret:
@@ -280,6 +281,7 @@ def main():
     installed = ctl(["install", ALLOWED])
     say("install %s" % json.dumps({k: installed[k] for k in installed if k != "ok"}))
     ctl(["set-fault", "off"])
+    ctl(["clear-fault-config"])
     ctl(["set-max", "8388608"])
     SECRET = ctl(["secret"], secret=True)
     if len(SECRET) < 16:
@@ -323,6 +325,11 @@ def main():
     check_owner_stale(staff, tickets["owner"])
     check_no_access_options(fx["no_access_staff"], staff, tickets["no_access"])
     check_oversize(staff, tickets["plain"])
+    check_unknown_does_not_adopt(staff, tickets["before_reply"])
+    check_distinct_notes(staff, tickets["two_notes"])
+    check_body_hash(staff, tickets["body_hash"])
+    check_due_preview(staff, tickets["due_date"])
+    check_planted_config(staff, tickets["planted"])
 
     say("")
     failed = [name for name, ok, _detail in results if not ok]
@@ -823,7 +830,7 @@ def check_race(staff, ticket):
 def check_fault_after_reply(staff, ticket):
     before = ctl(["state", ticket["number"]])
     marker = "Bridge fault reply %s" % uuid.uuid4().hex[:12]
-    summary = "The note must be posted by the retry, not a second reply."
+    summary = "The note is posted with the interrupted reply, and the retry must not send again."
     fields = {
         "ticket_number": ticket["number"],
         "staff_username": staff["username"],
@@ -831,7 +838,7 @@ def check_fault_after_reply(staff, ticket):
     }
     preview = post("preview", fields)
     if preview["code"] != 200 or not preview["json"].get("ok"):
-        record("12 fault after postReply then note-only retry", False,
+        record("12 interrupted native call is mail_handoff_unknown and the retry matches", False,
                "preview failed %s" % preview["raw"][:400])
         return
     fields["preview_hash"] = preview["json"]["preview_hash"]
@@ -843,42 +850,47 @@ def check_fault_after_reply(staff, ticket):
         sent = post("send", fields)
     finally:
         ctl(["set-fault", "off"])
-    if not sent or sent["code"] != 500 or not sent["json"] or sent["json"].get("error") != "partial_note_missing":
+    if not sent or sent["code"] != 500 or not sent["json"] or sent["json"].get("ok") or sent["json"].get("error") != "mail_handoff_unknown":
         problems.append("first send %s %s" % (
-            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:400]))
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
     else:
+        if "email" not in (sent["json"].get("message") or "").lower():
+            problems.append("message does not tell staff to check the email")
         response_id = sent["json"].get("response_entry_id")
+        note_id = sent["json"].get("note_entry_id")
+        if not response_id or not note_id:
+            problems.append("ids response %s note %s" % (response_id, note_id))
         ledger = ctl(["ledger", sent["rid"]])
-        if not ledger.get("found") or ledger.get("status") != "reply_recorded":
+        if ledger.get("status") != "reply_recorded_mail_unknown":
             problems.append("ledger %s" % ledger)
-        if ledger.get("response_entry_id") != response_id:
-            problems.append("ledger response id %s, body %s" % (
-                ledger.get("response_entry_id"), response_id))
+        if ledger.get("native_returned"):
+            problems.append("native_returned was set on an interrupted call")
+        if ledger.get("response_entry_id") != response_id or ledger.get("note_entry_id") != note_id:
+            problems.append("ledger ids %s body %s %s" % (
+                ledger, response_id, note_id))
         midway = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
-        replies = [entry for entry in midway if entry["type"] == "R"]
-        notes = [entry for entry in midway if entry["type"] == "N"]
-        if len(replies) != 1 or replies[0]["id"] != response_id:
-            problems.append("reply rows after the fault %s" % replies)
-        if notes:
-            problems.append("a note was posted during the fault")
-        retry = post("send", fields, rid=sent["rid"])
-        if retry["code"] != 200 or not retry["json"] or not retry["json"].get("ok"):
-            problems.append("retry %s %s" % (retry["code"], retry["raw"][:400]))
-        elif retry["json"].get("response_entry_id") != response_id:
-            problems.append("retry posted a different reply %s" % retry["json"])
-        final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
-        if len([entry for entry in final if entry["type"] == "R"]) != 1:
-            problems.append("R count after retry is not 1")
-        note_err = expect_note(final, staff, summary)
+        note_err = expect_note(midway, staff, summary)
         if note_err:
             problems.append(note_err)
+        replies = [entry for entry in midway if entry["type"] == "R"]
+        if len(replies) != 1 or replies[0]["id"] != response_id:
+            problems.append("reply rows %s" % replies)
+        retry = post("send", fields, rid=sent["rid"])
+        if retry["code"] != 500 or retry["raw"] != sent["raw"]:
+            problems.append("retry is not the stored result %s %s" % (
+                retry["code"], retry["raw"][:400]))
+        final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        if len([entry for entry in final if entry["type"] == "R"]) != 1:
+            problems.append("retry added a reply")
+        if len([entry for entry in final if entry["type"] == "N"]) != 1:
+            problems.append("retry added a note")
         done = ctl(["ledger", sent["rid"]])
-        if done.get("status") != "completed" or not done.get("note_entry_id"):
+        if done.get("status") != "reply_recorded_mail_unknown" or done.get("note_entry_id") != note_id:
             problems.append("ledger after retry %s" % done)
     detail = "ticket %s" % ticket["number"]
     if problems:
         detail += "\n" + "\n".join(problems)
-    record("12 fault after postReply then note-only retry", not problems, detail)
+    record("12 interrupted native call is mail_handoff_unknown and the retry matches", not problems, detail)
 
 
 def check_fault_note(staff, ticket):
@@ -914,6 +926,8 @@ def check_fault_note(staff, ticket):
         ledger = ctl(["ledger", sent["rid"]])
         if ledger.get("status") != "reply_recorded" or ledger.get("note_entry_id"):
             problems.append("ledger %s" % ledger)
+        if not ledger.get("native_returned"):
+            problems.append("native_returned was not set after postReply returned")
         midway = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
         if len([entry for entry in midway if entry["type"] == "R"]) != 1:
             problems.append("expected one reply before the retry")
@@ -1166,9 +1180,358 @@ def check_oversize(staff, ticket):
     record("17 oversized body is rejected", not problems, detail)
 
 
-if __name__ == "__main__":
+def write_template(number, subject, body):
+    return ctl(
+        ["set-reply-template", number],
+        stdin=json.dumps({"subject": subject, "body": body}),
+    )
+
+
+def restore_template(number, original, problems):
     try:
-        sys.exit(main())
+        restored = write_template(number, original["subject"], original["body"])
+    except (Exception, SystemExit) as exc:
+        problems.append("template restore failed: %s" % exc)
+        return
+    if restored.get("subject") != original["subject"] or restored.get("body") != original["body"]:
+        problems.append("template was not restored")
+
+
+def check_unknown_does_not_adopt(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    marker = "Bridge unknown %s" % uuid.uuid4().hex[:12]
+    summary = "This request must stay unknown after a later staff reply."
+    fields = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>%s</p>" % marker,
+    }
+    preview = post("preview", fields)
+    if preview["code"] != 200 or not preview["json"].get("ok"):
+        record("18 failure before the reply does not adopt a later one", False,
+               "preview failed %s" % preview["raw"][:400])
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    fields["note_summary"] = summary
+    problems = []
+    sent = None
+    try:
+        ctl(["set-fault", "before_reply"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or not sent["json"] or sent["json"].get("error") != "reply_state_unknown":
+        problems.append("first send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    else:
+        if sent["json"].get("ok") or sent["json"].get("response_entry_id") is not None:
+            problems.append("unknown result claimed an entry %s" % sent["json"])
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "reply_state_unknown" or ledger.get("response_entry_id"):
+            problems.append("ledger %s" % ledger)
+        ui_text = "UI reply that must not be adopted %s" % uuid.uuid4().hex[:12]
+        ui = ctl(["ui-reply", ticket["number"], staff["username"], ui_text])
+        if not ui.get("response_entry_id"):
+            problems.append("ui reply did not post %s" % ui)
+        midway = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        replies = [entry for entry in midway if entry["type"] == "R"]
+        notes = [entry for entry in midway if entry["type"] == "N"]
+        if len(replies) != 1 or replies[0]["id"] != ui.get("response_entry_id"):
+            problems.append("expected only the UI reply, got %s" % replies)
+        if notes:
+            problems.append("a note was posted for the unknown request")
+        retry = post("send", fields, rid=sent["rid"])
+        if retry["code"] != 500 or retry["raw"] != sent["raw"]:
+            problems.append("retry is not the stored result %s %s" % (
+                retry["code"], retry["raw"][:400]))
+        done = ctl(["ledger", sent["rid"]])
+        if done.get("response_entry_id") or done.get("note_entry_id") or done.get("status") != "reply_state_unknown":
+            problems.append("retry adopted an entry %s" % done)
+        final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        if len([entry for entry in final if entry["type"] == "R"]) != 1:
+            problems.append("retry posted a reply")
+        if any(entry["type"] == "N" for entry in final):
+            problems.append("retry posted a note")
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("18 failure before the reply does not adopt a later one", not problems, detail)
+
+
+def check_distinct_notes(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    summary_a = "Note A is owed by the first request only."
+    summary_b = "Note B belongs to the second request."
+    marker_a = "Bridge note A %s" % uuid.uuid4().hex[:12]
+    marker_b = "Bridge note B %s" % uuid.uuid4().hex[:12]
+    fields_a = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>%s</p>" % marker_a,
+    }
+    preview_a = post("preview", fields_a)
+    if preview_a["code"] != 200 or not preview_a["json"].get("ok"):
+        record("19 a failed note is posted on retry and is not the other send's note", False,
+               "preview A failed %s" % preview_a["raw"][:400])
+        return
+    fields_a["preview_hash"] = preview_a["json"]["preview_hash"]
+    fields_a["note_summary"] = summary_a
+    problems = []
+    sent_a = None
+    try:
+        ctl(["set-fault", "note_fail"])
+        sent_a = post("send", fields_a)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent_a or sent_a["code"] != 500 or not sent_a["json"] or sent_a["json"].get("error") != "partial_note_missing":
+        problems.append("send A %s %s" % (
+            sent_a["code"] if sent_a else 0, (sent_a or {}).get("raw", "")[:400]))
+    else:
+        fields_b = {
+            "ticket_number": ticket["number"],
+            "staff_username": staff["username"],
+            "response_html": "<p>%s</p>" % marker_b,
+        }
+        preview_b = post("preview", fields_b)
+        if preview_b["code"] != 200 or not preview_b["json"].get("ok"):
+            problems.append("preview B %s" % preview_b["raw"][:300])
+        else:
+            fields_b["preview_hash"] = preview_b["json"]["preview_hash"]
+            fields_b["note_summary"] = summary_b
+            sent_b = post("send", fields_b)
+            if sent_b["code"] != 200 or not sent_b["json"] or not sent_b["json"].get("ok"):
+                problems.append("send B %s %s" % (sent_b["code"], sent_b["raw"][:400]))
+            else:
+                note_b = sent_b["json"].get("note_entry_id")
+                retry = post("send", fields_a, rid=sent_a["rid"])
+                if retry["code"] != 200 or not retry["json"] or not retry["json"].get("ok"):
+                    problems.append("retry A %s %s" % (retry["code"], retry["raw"][:400]))
+                elif (retry["json"].get("error") == "stale_preview"
+                        or retry["json"].get("note_entry_id") == note_b):
+                    problems.append("retry A did not post its own note %s" % retry["json"])
+                else:
+                    note_a = retry["json"].get("note_entry_id")
+                    final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+                    replies = [entry for entry in final if entry["type"] == "R"]
+                    notes = [entry for entry in final if entry["type"] == "N"]
+                    if len(replies) != 2:
+                        problems.append("R count %s" % len(replies))
+                    if len(notes) != 2:
+                        problems.append("N count %s" % len(notes))
+                    bodies = {entry["id"]: entry["body"].replace("\r\n", "\n") for entry in notes}
+                    want_a = "Reply sent using Claude by %s\n\n%s" % (staff["name"], summary_a)
+                    want_b = "Reply sent using Claude by %s\n\n%s" % (staff["name"], summary_b)
+                    if bodies.get(note_a) != want_a:
+                        problems.append("note A body %r" % bodies.get(note_a))
+                    if bodies.get(note_b) != want_b:
+                        problems.append("note B body %r" % bodies.get(note_b))
+                    if note_a == note_b:
+                        problems.append("note ids are not distinct")
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("19 a failed note is posted on retry and is not the other send's note", not problems, detail)
+
+
+def check_body_hash(staff, ticket):
+    original = ctl(["reply-template", ticket["number"]])
+    before = ctl(["state", ticket["number"]])
+    problems = []
+    try:
+        written = write_template(
+            ticket["number"],
+            original["subject"],
+            "<p>Static reply template with no response variable.</p><p>%{poster}</p>",
+        )
+        if "%{response}" in (written.get("body") or "").lower():
+            problems.append("template still contains the response variable: %s" % written.get("body"))
+        else:
+            marker_a = "Alpha body %s" % uuid.uuid4().hex[:12]
+            marker_b = "Beta body %s" % uuid.uuid4().hex[:12]
+            fields_a = {
+                "ticket_number": ticket["number"],
+                "staff_username": staff["username"],
+                "response_html": "<p>%s</p>" % marker_a,
+            }
+            fields_b = {
+                "ticket_number": ticket["number"],
+                "staff_username": staff["username"],
+                "response_html": "<p>%s</p>" % marker_b,
+            }
+            first = post("preview", fields_a)
+            second = post("preview", fields_b)
+            if first["code"] != 200 or not first["json"].get("ok") or second["code"] != 200 or not second["json"].get("ok"):
+                problems.append("preview %s %s" % (first["raw"][:200], second["raw"][:200]))
+            else:
+                if first["json"].get("body") != second["json"].get("body"):
+                    problems.append("rendered bodies differ without a response variable")
+                if first["json"].get("preview_hash") == second["json"].get("preview_hash"):
+                    problems.append("hashes match for different response_html")
+                fields_b["preview_hash"] = first["json"]["preview_hash"]
+                fields_b["note_summary"] = "This send must be refused as stale."
+                sent = post("send", fields_b)
+                after = ctl(["state", ticket["number"]])
+                entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+                if not (sent["code"] == 409 and sent["json"] and sent["json"].get("error") == "stale_preview"):
+                    problems.append("send %s %s" % (sent["code"], sent["raw"][:300]))
+                if any(entry["type"] == "R" for entry in entries) or after["last_entry_id"] != before["last_entry_id"]:
+                    problems.append("thread moved")
+    finally:
+        restore_template(ticket["number"], original, problems)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("20 changed response_html is stale when the template omits response", not problems, detail)
+
+
+def check_due_preview(staff, ticket):
+    original = ctl(["reply-template", ticket["number"]])
+    before = ctl(["state", ticket["number"]])
+    problems = []
+    outcome = ""
+    try:
+        written = write_template(
+            ticket["number"],
+            "Due %{ticket.due_date} ref %{ticket.number}",
+            "<p>%{response}</p><p>Due %{ticket.due_date}</p>",
+        )
+        blob = (written.get("subject") or "") + "\n" + (written.get("body") or "")
+        if "ticket.due_date" not in blob:
+            problems.append("due_date token was not stored: %s" % blob[:300])
+        else:
+            opts = post("options", {
+                "ticket_number": ticket["number"],
+                "staff_username": staff["username"],
+            })
+            closed = []
+            if opts["json"] and opts["json"].get("statuses"):
+                closed = [item for item in opts["json"]["statuses"]["options"] if item.get("state") == "closed"]
+            if not closed:
+                problems.append("no closed status in the reply choices")
+            else:
+                marker = "Bridge due date %s" % uuid.uuid4().hex[:12]
+                fields = {
+                    "ticket_number": ticket["number"],
+                    "staff_username": staff["username"],
+                    "response_html": "<p>%s</p>" % marker,
+                    "reply_status_id": closed[0]["id"],
+                }
+                preview = post("preview", fields)
+                err = (preview["json"] or {}).get("error")
+                if preview["code"] == 409 and err == "preview_unsupported":
+                    outcome = "preview_unsupported"
+                    variables = (preview["json"] or {}).get("variables") or []
+                    if "ticket.due_date" not in variables:
+                        problems.append("variables %s" % variables)
+                elif preview["code"] == 200 and preview["json"] and preview["json"].get("ok"):
+                    outcome = "exact"
+                    fields["preview_hash"] = preview["json"]["preview_hash"]
+                    fields["note_summary"] = "Closing reply used to compare the due date."
+                    before_mail = mail_index()
+                    sent = post("send", fields)
+                    if sent["code"] != 200 or not sent["json"] or not sent["json"].get("ok"):
+                        problems.append("send %s %s" % (sent["code"], sent["raw"][:400]))
+                    else:
+                        hits = mail_for_marker(new_messages(before_mail), marker, ticket["owner_email"])
+                        if len(hits) != 1:
+                            problems.append("mail hits %s" % len(hits))
+                        else:
+                            mail_text = visible_text((hits[0].get("HTML") or "") + "\n" + (hits[0].get("Text") or ""))
+                            prev_text = visible_text(preview["json"].get("body") or "")
+                            if not prev_text or prev_text not in mail_text:
+                                problems.append("preview body is not the mail body")
+                            if hits[0].get("Subject") != preview["json"].get("subject"):
+                                problems.append("subject %r preview %r" % (
+                                    hits[0].get("Subject"), preview["json"].get("subject")))
+                else:
+                    problems.append("preview %s %s" % (preview["code"], preview["raw"][:400]))
+    finally:
+        restore_template(ticket["number"], original, problems)
+        changed = True
+        try:
+            later = ctl(["state", ticket["number"]])
+            changed = (
+                later["status_id"] != before["status_id"]
+                or later["staff_id"] != before["staff_id"]
+            )
+        except (Exception, SystemExit) as exc:
+            problems.append("could not read the ticket after the due-date check: %s" % exc)
+        if changed:
+            try:
+                restored_state = ctl(["restore", ticket["number"], str(before["status_id"]), str(before["staff_id"])])
+                if restored_state.get("status_id") != before["status_id"] or restored_state.get("state") != "open":
+                    problems.append("restore left the ticket %s" % restored_state)
+            except (Exception, SystemExit) as exc:
+                problems.append("ticket restore failed: %s" % exc)
+    detail = "ticket %s %s" % (ticket["number"], outcome or "no-result")
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("21 closing preview with ticket.due_date is exact or unsupported", not problems, detail)
+
+
+def check_planted_config(staff, ticket):
+    ctl(["set-fault", "off"])
+    planted = ctl(["plant-fault-config", "after_reply"])
+    problems = []
+    sent = None
+    try:
+        if planted.get("value") != "after_reply":
+            problems.append("config row was not planted %s" % planted)
+        else:
+            before = ctl(["state", ticket["number"]])
+            marker = "Bridge planted config %s" % uuid.uuid4().hex[:12]
+            summary = "A stored test_fault value must not change this reply."
+            fields = {
+                "ticket_number": ticket["number"],
+                "staff_username": staff["username"],
+                "response_html": "<p>%s</p>" % marker,
+            }
+            preview = post("preview", fields)
+            if preview["code"] != 200 or not preview["json"].get("ok"):
+                problems.append("preview %s" % preview["raw"][:300])
+            else:
+                fields["preview_hash"] = preview["json"]["preview_hash"]
+                fields["note_summary"] = summary
+                sent = post("send", fields)
+                if sent["code"] != 200 or not sent["json"] or not sent["json"].get("ok"):
+                    problems.append("send %s %s" % (sent["code"], sent["raw"][:400]))
+                elif sent["json"].get("mail") != "handed_to_osticket":
+                    problems.append("mail %s" % sent["json"].get("mail"))
+                else:
+                    ledger = ctl(["ledger", sent["rid"]])
+                    if ledger.get("status") != "completed" or not ledger.get("native_returned"):
+                        problems.append("ledger %s" % ledger)
+                    entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+                    note_err = expect_note(entries, staff, summary)
+                    if note_err:
+                        problems.append(note_err)
+                    if len([entry for entry in entries if entry["type"] == "R"]) != 1:
+                        problems.append("R count is not 1")
+    finally:
+        cleared = ctl(["clear-fault-config"])
+        if cleared.get("value") is not None:
+            problems.append("config row remains %s" % cleared)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("22 a persisted test_fault value is ignored", not problems, detail)
+
+
+def cleanup_faults():
+    for args in (["set-fault", "off"], ["clear-fault-config"], ["set-max", "8388608"]):
+        try:
+            ctl(args)
+        except (Exception, SystemExit) as exc:
+            say("cleanup %s failed: %s" % (" ".join(args), exc))
+
+
+if __name__ == "__main__":
+    code = 1
+    try:
+        code = main()
     except Exception as exc:
         say("ERROR %s" % exc)
         raise
+    finally:
+        cleanup_faults()
+    sys.exit(code)
