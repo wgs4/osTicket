@@ -1086,8 +1086,16 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     /**
-     * Variables whose value after postReply depends on the clock. Listed
-     * as they appear in the template, for example ticket.due_date.
+     * Variables whose post-reply value this preview cannot project.
+     * Listed as they appear in the template, for example ticket.due_date
+     * or ticket.thread.complete.
+     *
+     * ticket.thread.lastmessage is Thread::getLastMessage(), type M only
+     * (class.thread.php). addResponse does not change it. ticket.thread.original
+     * is the flagged original message, also type M. %{ticket.thread} and
+     * %{ticket.thread.complete} render ThreadEntries, which lists messages
+     * and responses (thread-export.tmpl.php), so the mail includes the new
+     * response and a preview of the old thread would not match.
      */
     function unsupportedPreviewVars($ticket, array $resolved) {
         $status = TicketStatus::lookup((int) $resolved['reply_status_id']);
@@ -1099,6 +1107,8 @@ class WgsReplyBridgePlugin extends Plugin {
         $bad = array();
         foreach ($this->templateTicketVars($ticket) as $name) {
             $root = $this->ticketVarRoot($name);
+            if ($this->threadExpansionUnstable($name))
+                $bad[$name] = true;
             if ($closing && ($root === 'close_date' || $root === 'last_update' || $root === 'lastupdate'))
                 $bad[$name] = true;
             if ($closing && $root === 'due_date' && $unstableDue)
@@ -1110,6 +1120,28 @@ class WgsReplyBridgePlugin extends Plugin {
         $out = array_keys($bad);
         sort($out);
         return $out;
+    }
+
+    /**
+     * True when this ticket.thread path includes the response postReply is
+     * about to add. lastmessage, last_message, and original stay false:
+     * each one is a customer message that already exists.
+     */
+    function threadExpansionUnstable($name) {
+        $name = strtolower((string) $name);
+        if (strpos($name, 'ticket.thread') !== 0)
+            return false;
+        $path = substr($name, strlen('ticket.thread'));
+        if ($path === '')
+            return true;
+        if ($path[0] !== '.')
+            return false;
+        $path = substr($path, 1);
+        foreach (array('lastmessage', 'last_message', 'original') as $stable) {
+            if ($path === $stable || strpos($path, $stable . '.') === 0)
+                return false;
+        }
+        return true;
     }
 
     /**
@@ -1891,14 +1923,15 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     /**
-     * No response row was captured for this request. Remember that and
-     * never send it again. A later reply on the ticket is not this request.
+     * No response id was captured. ThreadEntry::create saves the row before
+     * the signal, so the entry may exist. Do not claim it does not, and do
+     * not go looking for it. This request is not sent again.
      */
     function storeReplyUnknown($requestId) {
         $body = array(
             'ok' => false,
             'error' => 'reply_state_unknown',
-            'message' => 'The reply did not save an entry for this request. This request will not be sent again.',
+            'message' => 'Persistence and mail handoff for this request are unknown. Check the ticket thread before sending again. If a reply is there, its "Reply sent using Claude" note is missing and must be added by hand. This request will not be sent again.',
             'response_entry_id' => null,
         );
         $json = $this->encode($body);

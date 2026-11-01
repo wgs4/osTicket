@@ -101,7 +101,13 @@ If the department `ticket.reply` template names one of those values
 `ticket.due_date` that can change inside the 15 minute preview window, or any
 `ticket.due_date` on a reopen), preview and send refuse with
 `preview_unsupported` and a `variables` list. They do not return a rendering
-that would not match the mail.
+that would not match the mail. `%{ticket.thread}` and
+`%{ticket.thread.complete}` (including `complete.reversed`) list messages and
+responses, so the sent mail contains the new reply and the preview of the
+old thread would not. Those are refused the same way.
+`%{ticket.thread.lastmessage}` is the last customer message (type M) and
+`%{ticket.thread.original}` is the original customer message. A new response
+does not change either, and preview still renders them.
 
 Send order:
 
@@ -134,8 +140,12 @@ A `postReply` that saved a row and then threw, or that returned a different
 entry than the one captured, is `reply_recorded_mail_unknown`. The audit note
 is still posted. The result is `ok: false`, error `mail_handoff_unknown`,
 with both entry ids. A retry returns that stored result and does not send
-again. A call that saved no row is `reply_state_unknown`. A later reply on
-the ticket, including one by the same agent, is not adopted.
+again. A call that captured no response id is `reply_state_unknown`. The
+entry may already have been saved, because osTicket writes the row before
+it signals. The result says persistence and mail handoff are unknown, and
+that a saved reply is missing its `Reply sent using Claude` note, which
+staff add by hand. A later reply on the ticket, including one by the same
+agent, is not adopted.
 
 The internal note is:
 
@@ -182,8 +192,9 @@ The ledger is a state machine. A row is never deleted once execution starts.
 - `reply_recorded_mail_unknown`: the response row was captured and the call
   did not finish normally. The stored result tells staff to check whether
   the customer got the email. This request will not be sent again.
-- `reply_state_unknown`: no response row was captured for this request. The
-  stored result says the reply did not save an entry. This request will not
+- `reply_state_unknown`: no response id was captured for this request.
+  Persistence and mail handoff are unknown. Staff check the thread and, if
+  the reply is there, add the missing note by hand. This request will not
   be sent again, and a later thread entry is not attached to it.
 - `completed`: the note id and the success JSON. `mail` is
   `handed_to_osticket` only on this path.
@@ -233,9 +244,9 @@ ignored. A `test_fault` row in plugin config does nothing.
   the signature, or the message body. A crash after the response row is
   saved leaves `reply_recorded_mail_unknown` (or `reply_recorded` when
   `postReply` had already returned). The same request id finishes the note
-  when it is missing and does not post a second reply. A crash before any
-  response row is saved leaves `reply_state_unknown` and does not attach a
-  later entry.
+  when it is missing and does not post a second reply. A crash before the
+  response id is captured leaves `reply_state_unknown`. The row may already
+  exist. The bridge does not attach a later entry and does not resend.
 - Staging only: the edge proxy's address is what osTicket sees for requests
   from the host, because `TRUSTED_PROXIES` is empty. Allow the `ost_internal`
   subnet there. Do not copy that override to production.

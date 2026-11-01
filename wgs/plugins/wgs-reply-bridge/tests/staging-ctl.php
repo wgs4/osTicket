@@ -407,12 +407,33 @@ function bridge_fixtures() {
     $bodyHash = $take($buckets['any']);
     $due = $take($buckets['close']);
     $planted = $take($buckets['any']);
+    // The real department template, not a swapped one. lastmessage has to
+    // be in it so the suite can prove that variable still previews.
+    $threadVars = null;
+    foreach ($buckets['any'] as $candidate) {
+        $number = (string) $candidate->getNumber();
+        if (isset($used[$number]))
+            continue;
+        $dept = $candidate->getDept();
+        $tpl = $dept ? $dept->getTemplate() : null;
+        $msg = $tpl ? $tpl->getReplyMsgTemplate() : null;
+        if (!$msg)
+            continue;
+        $blob = strtolower((string) $msg->getSubject() . "\n" . (string) $msg->getBody());
+        if (strpos($blob, 'ticket.thread.lastmessage') === false)
+            continue;
+        $used[$number] = true;
+        $threadVars = $candidate;
+        break;
+    }
     if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale
             || !$race || !$faultReply || !$faultNote || !$owner
-            || !$beforeReply || !$twoNotes || !$bodyHash || !$due || !$planted)
+            || !$beforeReply || !$twoNotes || !$bodyHash || !$due || !$planted
+            || !$threadVars)
         bridge_fail('Not enough distinct tickets for the reply staff.', array(
             'any' => count($buckets['any']),
             'close' => count($buckets['close']),
+            'thread_lastmessage' => $threadVars ? true : false,
         ));
 
     $noAccessStaff = null;
@@ -484,6 +505,7 @@ function bridge_fixtures() {
             'body_hash' => bridge_brief($bodyHash),
             'due_date' => bridge_brief($due),
             'planted' => bridge_brief($planted),
+            'thread_vars' => bridge_brief($threadVars),
             'no_access' => bridge_brief($noAccessTicket),
             'no_reply' => bridge_brief($noReplyTicket),
         ),

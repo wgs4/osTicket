@@ -330,6 +330,7 @@ def main():
     check_body_hash(staff, tickets["body_hash"])
     check_due_preview(staff, tickets["due_date"])
     check_planted_config(staff, tickets["planted"])
+    check_thread_vars(staff, tickets["thread_vars"])
 
     say("")
     failed = [name for name, ok, _detail in results if not ok]
@@ -1226,6 +1227,14 @@ def check_unknown_does_not_adopt(staff, ticket):
     else:
         if sent["json"].get("ok") or sent["json"].get("response_entry_id") is not None:
             problems.append("unknown result claimed an entry %s" % sent["json"])
+        message = sent["json"].get("message") or ""
+        lower = message.lower()
+        if "did not save" in lower:
+            problems.append("message claims the reply was not saved: %s" % message)
+        if ("unknown" not in lower or "ticket thread" not in lower
+                or "reply sent using claude" not in lower or "by hand" not in lower
+                or "will not be sent again" not in lower):
+            problems.append("message does not say the handoff is unknown: %s" % message)
         ledger = ctl(["ledger", sent["rid"]])
         if ledger.get("status") != "reply_state_unknown" or ledger.get("response_entry_id"):
             problems.append("ledger %s" % ledger)
@@ -1515,6 +1524,81 @@ def check_planted_config(staff, ticket):
     if problems:
         detail += "\n" + "\n".join(problems)
     record("22 a persisted test_fault value is ignored", not problems, detail)
+
+
+def check_thread_vars(staff, ticket):
+    original = ctl(["reply-template", ticket["number"]])
+    blob = ((original.get("subject") or "") + "\n" + (original.get("body") or "")).lower()
+    problems = []
+    if "ticket.thread.lastmessage" not in blob:
+        record("23 thread.complete is unsupported and thread.lastmessage matches the mail", False,
+               "real template has no ticket.thread.lastmessage\n%s" % blob[:400])
+        return
+    try:
+        marker = "Bridge lastmessage %s" % uuid.uuid4().hex[:12]
+        fields = {
+            "ticket_number": ticket["number"],
+            "staff_username": staff["username"],
+            "response_html": "<p>%s</p>" % marker,
+        }
+        before_mail = mail_index()
+        preview = post("preview", fields)
+        if preview["code"] != 200 or not preview["json"] or not preview["json"].get("ok"):
+            problems.append("lastmessage preview %s %s" % (preview["code"], preview["raw"][:400]))
+        elif (preview["json"].get("error") == "preview_unsupported"):
+            problems.append("lastmessage was refused %s" % preview["json"].get("variables"))
+        else:
+            fields["preview_hash"] = preview["json"]["preview_hash"]
+            fields["note_summary"] = "Real template, last customer message stays in the mail."
+            sent = post("send", fields)
+            if sent["code"] != 200 or not sent["json"] or not sent["json"].get("ok"):
+                problems.append("lastmessage send %s %s" % (sent["code"], sent["raw"][:400]))
+            else:
+                hits = mail_for_marker(new_messages(before_mail), marker, ticket["owner_email"])
+                if len(hits) != 1:
+                    problems.append("lastmessage mail hits %s" % len(hits))
+                else:
+                    mail_err = check_reply_mail(
+                        preview["json"], new_messages(before_mail), ticket["owner_email"], marker)
+                    if mail_err:
+                        problems.append(mail_err)
+                    mail_text = visible_text((hits[0].get("HTML") or "") + "\n" + (hits[0].get("Text") or ""))
+                    prev_text = visible_text(preview["json"].get("body") or "")
+                    if not prev_text or prev_text not in mail_text:
+                        problems.append("preview body is not the mail body (%s vs %s chars)" % (
+                            len(prev_text), len(mail_text)))
+
+        mid = ctl(["state", ticket["number"]])
+        written = write_template(
+            ticket["number"],
+            "Thread %{ticket.number}",
+            "<p>%{response}</p><p>%{ticket.thread.complete}</p>",
+        )
+        written_blob = ((written.get("subject") or "") + "\n" + (written.get("body") or "")).lower()
+        if "ticket.thread.complete" not in written_blob:
+            problems.append("complete token was not stored")
+        else:
+            refused = post("preview", {
+                "ticket_number": ticket["number"],
+                "staff_username": staff["username"],
+                "response_html": "<p>This preview must be refused.</p>",
+            })
+            err = (refused["json"] or {}).get("error")
+            variables = (refused["json"] or {}).get("variables") or []
+            if refused["code"] != 409 or err != "preview_unsupported":
+                problems.append("complete preview %s %s" % (refused["code"], refused["raw"][:400]))
+            elif "ticket.thread.complete" not in variables:
+                problems.append("variables %s" % variables)
+            after = ctl(["state", ticket["number"]])
+            if after["last_entry_id"] != mid["last_entry_id"]:
+                problems.append("refused preview posted an entry %s -> %s" % (
+                    mid["last_entry_id"], after["last_entry_id"]))
+    finally:
+        restore_template(ticket["number"], original, problems)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("23 thread.complete is unsupported and thread.lastmessage matches the mail", not problems, detail)
 
 
 def cleanup_faults():
