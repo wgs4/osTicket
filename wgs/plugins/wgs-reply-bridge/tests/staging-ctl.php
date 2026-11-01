@@ -68,6 +68,32 @@ try {
     case 'restore':
         bridge_out(bridge_restore($argv[2], (int) $argv[3], (int) $argv[4]));
         break;
+    case 'set-fault':
+        $flag = isset($argv[2]) ? (string) $argv[2] : 'off';
+        if ($flag === 'off')
+            $flag = '';
+        if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail')
+            bridge_fail('Fault must be after_reply, note_fail, or off.');
+        bridge_out(bridge_config(array('test_fault' => $flag)));
+        break;
+    case 'set-max':
+        $max = isset($argv[2]) ? (int) $argv[2] : 0;
+        if ($max < 1)
+            bridge_fail('max_body_bytes must be a positive number.');
+        bridge_out(bridge_config(array('max_body_bytes' => (string) $max)));
+        break;
+    case 'set-collab':
+        bridge_out(bridge_set_collab($argv[2], (int) $argv[3], (int) $argv[4]));
+        break;
+    case 'other-user':
+        bridge_out(bridge_other_user($argv[2]));
+        break;
+    case 'set-owner':
+        bridge_out(bridge_set_owner($argv[2], $argv[3], (int) $argv[4]));
+        break;
+    case 'ledger':
+        bridge_out(bridge_ledger($argv[2]));
+        break;
     default:
         bridge_fail('Unknown command.', array('noise' => $noise));
     }
@@ -140,6 +166,7 @@ function bridge_install($cidr) {
             'allowed_ips' => $cidr,
             'enabled' => 1,
             'max_body_bytes' => '8388608',
+            'test_fault' => '',
         );
         $inst = $impl->addInstance($vars, $errors);
         if (!$inst)
@@ -161,6 +188,7 @@ function bridge_install($cidr) {
                 'allowed_ips' => $cidr,
                 'enabled' => 1,
                 'max_body_bytes' => (string) ($inst->getConfig()->get('max_body_bytes') ?: '8388608'),
+                'test_fault' => (string) $inst->getConfig()->get('test_fault'),
             );
             if (!$inst->update($vars, $errors))
                 bridge_fail('Could not update the plugin instance.', array('errors' => $errors));
@@ -221,6 +249,7 @@ function bridge_active_collabs($ticket) {
             $rows[] = array(
                 'user_id' => (int) $c->getUserId(),
                 'active' => $on,
+                'email' => strtolower((string) $c->getEmail()),
             );
         }
     }
@@ -262,6 +291,7 @@ function bridge_brief($ticket) {
         'dept_id' => $dept ? (int) $dept->getId() : 0,
         'dept_name' => $dept ? (string) $dept->getName() : '',
         'dept_email' => $email ? (string) $email->getAddress() : '',
+        'owner_user_id' => (int) $ticket->getOwnerId(),
         'owner_email' => (string) $ticket->getEmail(),
         'owner_name' => ($ticket->getOwner() ? (string) $ticket->getOwner()->getName() : ''),
         'collaborators' => count($collabs),
@@ -355,8 +385,15 @@ function bridge_fixtures() {
     $close = $take($buckets['close']);
     $collab = $take($buckets['collab']);
     $stale = $take($buckets['any']);
-    if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale)
-        bridge_fail('Not enough distinct tickets for the reply staff.');
+    $race = $take($buckets['any']);
+    $faultReply = $take($buckets['any']);
+    $faultNote = $take($buckets['any']);
+    $owner = $take($buckets['any']);
+    if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale
+            || !$race || !$faultReply || !$faultNote || !$owner)
+        bridge_fail('Not enough distinct tickets for the reply staff.', array(
+            'any' => count($buckets['any']),
+        ));
 
     $noAccessStaff = null;
     $noAccessTicket = null;
@@ -418,6 +455,10 @@ function bridge_fixtures() {
             'close' => bridge_brief($close),
             'collab' => bridge_brief($collab),
             'stale' => bridge_brief($stale),
+            'race' => bridge_brief($race),
+            'fault_reply' => bridge_brief($faultReply),
+            'fault_note' => bridge_brief($faultNote),
+            'owner' => bridge_brief($owner),
             'no_access' => bridge_brief($noAccessTicket),
             'no_reply' => bridge_brief($noReplyTicket),
         ),
@@ -563,5 +604,133 @@ function bridge_restore($number, $statusId, $staffId) {
         'status_id' => (int) $ticket->getStatusId(),
         'state' => (string) $ticket->getState(),
         'staff_id' => $ticket->getStaffId() ? (int) $ticket->getStaffId() : 0,
+    );
+}
+
+function bridge_instance() {
+    $plugin = bridge_plugin();
+    if (!$plugin)
+        bridge_fail('Plugin is not installed.');
+    foreach ($plugin->getInstances() as $inst)
+        return $inst;
+    bridge_fail('Plugin has no instance.');
+}
+
+/**
+ * Rewrite one non-secret setting. The decrypted secret is posted back so
+ * the password field does not wipe it. The secret is not part of the output.
+ */
+function bridge_config($changes) {
+    $_SERVER['REQUEST_METHOD'] = 'POST';
+    $inst = bridge_instance();
+    $cfg = $inst->getConfig();
+    $vars = array(
+        'name' => $inst->getName() ?: 'WGS Reply Bridge',
+        'notes' => '',
+        'isactive' => 1,
+        'shared_secret' => (string) $cfg->get('shared_secret'),
+        'allowed_ips' => (string) $cfg->get('allowed_ips'),
+        'enabled' => $cfg->get('enabled') ? 1 : 0,
+        'max_body_bytes' => (string) ($cfg->get('max_body_bytes') ?: '8388608'),
+        'test_fault' => (string) $cfg->get('test_fault'),
+    );
+    foreach ($changes as $key => $value) {
+        if (!array_key_exists($key, $vars) || $key === 'shared_secret')
+            bridge_fail('Refusing to change that setting.');
+        $vars[$key] = $value;
+    }
+    $errors = array();
+    if (!$inst->update($vars, $errors))
+        bridge_fail('Could not update the plugin instance.', array('errors' => $errors));
+    $out = array('ok' => true);
+    foreach ($changes as $key => $value)
+        $out[$key] = $value;
+    return $out;
+}
+
+function bridge_set_collab($number, $userId, $active) {
+    $ticket = bridge_ticket($number);
+    if ($list = $ticket->getCollaborators()) {
+        foreach ($list as $c) {
+            if ((int) $c->getUserId() !== (int) $userId)
+                continue;
+            $c->setFlag(Collaborator::FLAG_ACTIVE, $active ? true : false);
+            if (!$c->save())
+                bridge_fail('Could not save the collaborator flag.');
+            return array(
+                'ok' => true,
+                'user_id' => (int) $userId,
+                'active' => $c->isActive() ? true : false,
+            );
+        }
+    }
+    bridge_fail('That user is not a collaborator on this ticket.');
+}
+
+function bridge_other_user($number) {
+    $ticket = bridge_ticket($number);
+    $skip = array((int) $ticket->getOwnerId() => true);
+    if ($list = $ticket->getCollaborators()) {
+        foreach ($list as $c)
+            $skip[(int) $c->getUserId()] = true;
+    }
+    foreach (User::objects()->order_by('id')->limit(500) as $user) {
+        $id = (int) $user->getId();
+        if (isset($skip[$id]))
+            continue;
+        $email = strtolower((string) $user->getEmail());
+        if ($email === '' || strpos($email, '@') === false)
+            continue;
+        return array(
+            'ok' => true,
+            'user_id' => $id,
+            'email' => $email,
+        );
+    }
+    bridge_fail('No user is available who is neither the owner nor a collaborator.');
+}
+
+function bridge_set_owner($number, $username, $userId) {
+    global $thisstaff;
+    $staff = bridge_staff($username);
+    $thisstaff = $staff;
+    $ticket = bridge_ticket($number);
+    $old = (int) $ticket->getOwnerId();
+    $user = User::lookup((int) $userId);
+    if (!$user)
+        bridge_fail('User was not found.');
+    if (!$ticket->changeOwner($user)) {
+        bridge_fail('changeOwner returned false.', array(
+            'can_edit' => $ticket->checkStaffPerm($staff, Ticket::PERM_EDIT) ? true : false,
+            'old_user_id' => $old,
+        ));
+    }
+    $fresh = Ticket::lookup((int) $ticket->getId());
+    return array(
+        'ok' => true,
+        'old_user_id' => $old,
+        'owner_user_id' => (int) $fresh->getOwnerId(),
+        'owner_email' => (string) $fresh->getEmail(),
+    );
+}
+
+function bridge_ledger($requestId) {
+    if (!preg_match('/^[A-Za-z0-9-]{36}$/', (string) $requestId))
+        bridge_fail('request id is not valid.');
+    $sql = 'SELECT status, ticket_id, staff_id, response_entry_id, note_entry_id,'
+        . ' baseline_entry_id FROM `' . TABLE_PREFIX . 'wgs_reply_ledger`'
+        . ' WHERE request_id=' . db_input($requestId);
+    if (!($res = db_query($sql)) || !db_num_rows($res))
+        return array('ok' => true, 'found' => false);
+    $row = db_fetch_array($res);
+    return array(
+        'ok' => true,
+        'found' => true,
+        'status' => (string) $row['status'],
+        'ticket_id' => (int) $row['ticket_id'],
+        'staff_id' => (int) $row['staff_id'],
+        'response_entry_id' => $row['response_entry_id'] ? (int) $row['response_entry_id'] : null,
+        'note_entry_id' => $row['note_entry_id'] ? (int) $row['note_entry_id'] : null,
+        'baseline_entry_id' => $row['baseline_entry_id'] !== null ? (int) $row['baseline_entry_id'] : null,
     );
 }

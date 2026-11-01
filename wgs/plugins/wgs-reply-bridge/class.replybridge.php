@@ -15,12 +15,14 @@ require_once dirname(__FILE__) . '/config.php';
 class WgsReplyBridgePlugin extends Plugin {
     var $config_class = 'WgsReplyBridgeConfig';
     var $instance = null;
-    // Request id whose ledger row is still "started". fail() deletes it so
-    // a rejected send can be retried. Cleared once postReply has saved.
-    var $rollbackRequest = null;
+    // GET_LOCK name held for this request. respond() releases it.
+    var $advisoryName = null;
+    var $nativeLockTicket = null;
+    var $nativeLockStaffId = 0;
 
     const PREVIEW_TTL = 900;
     const TIMESTAMP_SKEW = 300;
+    const ADVISORY_WAIT = 10;
 
     function isMultiInstance() {
         return false;
@@ -48,18 +50,43 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     function ensureLedger() {
-        $sql = 'CREATE TABLE IF NOT EXISTS `' . TABLE_PREFIX . 'wgs_reply_ledger` ('
+        $table = '`' . TABLE_PREFIX . 'wgs_reply_ledger`';
+        $sql = 'CREATE TABLE IF NOT EXISTS ' . $table . ' ('
             . '`request_id` VARCHAR(64) NOT NULL,'
             . '`ticket_id` INT UNSIGNED NOT NULL DEFAULT 0,'
             . '`staff_id` INT UNSIGNED NOT NULL DEFAULT 0,'
-            . '`status` VARCHAR(16) NOT NULL,'
+            . '`status` VARCHAR(32) NOT NULL,'
             . '`response_entry_id` INT UNSIGNED NULL,'
             . '`note_entry_id` INT UNSIGNED NULL,'
+            . '`baseline_entry_id` INT UNSIGNED NULL,'
+            . '`executing_at` INT UNSIGNED NULL,'
             . '`created` DATETIME NOT NULL,'
             . '`result_json` MEDIUMTEXT NULL,'
             . 'PRIMARY KEY (`request_id`)'
             . ') ENGINE=InnoDB DEFAULT CHARSET=utf8';
         db_query($sql);
+        // Tables created by 0.1 lack the execution cursor. Never drop rows.
+        if (!$this->ledgerColumn('baseline_entry_id'))
+            db_query('ALTER TABLE ' . $table . ' ADD COLUMN `baseline_entry_id` INT UNSIGNED NULL');
+        if (!$this->ledgerColumn('executing_at'))
+            db_query('ALTER TABLE ' . $table . ' ADD COLUMN `executing_at` INT UNSIGNED NULL');
+        // Once per install. ALTER on every request takes a metadata lock
+        // and would serialize two sends that should only share GET_LOCK.
+        if (!$this->ledgerStatusWide())
+            db_query('ALTER TABLE ' . $table . ' MODIFY `status` VARCHAR(32) NOT NULL');
+    }
+
+    function ledgerColumn($name) {
+        $sql = 'SHOW COLUMNS FROM `' . TABLE_PREFIX . 'wgs_reply_ledger` LIKE ' . db_input($name);
+        return ($res = db_query($sql)) && db_num_rows($res);
+    }
+
+    function ledgerStatusWide() {
+        $sql = 'SHOW COLUMNS FROM `' . TABLE_PREFIX . 'wgs_reply_ledger` LIKE ' . db_input('status');
+        if (!($res = db_query($sql)) || !($row = db_fetch_array($res)))
+            return false;
+        $type = isset($row['Type']) ? $row['Type'] : (isset($row['type']) ? $row['type'] : '');
+        return (bool) (preg_match('/varchar\((\d+)\)/i', (string) $type, $m) && (int) $m[1] >= 32);
     }
 
     // ---- HTTP gate -------------------------------------------------------
@@ -67,6 +94,10 @@ class WgsReplyBridgePlugin extends Plugin {
     function options() {
         $in = $this->gate('options');
         $ctx = $this->context($in, false);
+        // No ticket facts until access is granted. ticket-not-found already
+        // failed inside context() with an empty body.
+        if ($ctx['block'] && $ctx['block']['error'] === 'no_access')
+            $this->fail($ctx['block']['error'], $ctx['block']['message'], $ctx['block']['http']);
         $this->ok($this->buildOptions($ctx['ticket'], $ctx['staff'], $ctx['block']));
     }
 
@@ -87,70 +118,110 @@ class WgsReplyBridgePlugin extends Plugin {
         $in = $this->gate('send');
         $requestId = $this->requestId();
 
-        // Spec: a completed request id returns the stored result and does
-        // nothing else, even if the ticket has moved on since.
+        // A completed id returns the stored result and does nothing else,
+        // even if the ticket has moved on since.
         if ($stored = $this->ledgerFetch($requestId)) {
             if ($stored['status'] == 'completed' && $stored['result_json']) {
-                Http::response(200, $stored['result_json'], 'application/json');
+                $this->respond(200, $stored['result_json']);
             }
-            if ($stored['status'] == 'started')
-                $this->fail('already_done', 'This request id is already in progress.', 409);
         }
 
         $summary = isset($in['note_summary']) ? (string) $in['note_summary'] : '';
-        if (trim($summary) === '')
-            $this->fail('empty_summary', 'note_summary is required.', 400);
-
         $ctx = $this->context($in, true);
         $ticket = $ctx['ticket'];
         $staff = $ctx['staff'];
-        $resolved = $this->resolveReply($ticket, $staff, $in);
-        $this->assertPreviewHash($ticket, $staff, $resolved, @$in['preview_hash']);
 
-        if (!$this->ledgerInsert($requestId, $ticket->getId(), $staff->getId()))
-            $this->fail('already_done', 'This request id is already in progress.', 409);
-
-        $this->rollbackRequest = $requestId;
-        $lock = null;
-        $response = null;
+        $this->advisoryAcquire($ticket->getId());
         try {
-            $lock = $this->acquireLock($ticket, $staff);
+            $this->reloadTicket($ticket);
+            $row = $this->ledgerFetch($requestId);
+            if ($row && (int) $row['ticket_id'] !== (int) $ticket->getId())
+                $this->fail('already_done', 'This request id was used on another ticket.', 409);
+
+            if ($row && $row['status'] == 'completed' && $row['result_json'])
+                $this->respond(200, $row['result_json']);
+
+            if ($row && ($row['status'] == 'reply_recorded' || $row['status'] == 'executing')) {
+                $this->resumeLedger($ticket, $staff, $summary, $row);
+            }
+
+            if (trim($summary) === '')
+                $this->fail('empty_summary', 'note_summary is required.', 400);
+
+            $resolved = $this->resolveReply($ticket, $staff, $in);
+            $this->assertPreviewHash($ticket, $staff, $resolved, @$in['preview_hash']);
+
+            if (!$row)
+                $this->ledgerInsert($requestId, $ticket->getId(), $staff->getId(), 'reserved');
+            elseif ($row['status'] !== 'reserved')
+                $this->fail('already_done', 'This request id cannot be posted again.', 409);
+
+            // Drop a non-column `owner` dirty key before either save.
+            // postReply's setStatus ignores a failed save and leaves the
+            // ticket closed only in memory.
+            $this->dropOwnerDirty($ticket);
+            $this->nativeLock($ticket, $staff);
             $this->applyCollaborators($ticket, $resolved['ccs']);
+            $vars = $this->replyVars($resolved);
+            $baseline = $this->lastEntryId($ticket);
+            $this->ledgerMarkExecuting($requestId, $baseline);
 
             $errors = array();
-            $vars = $this->replyVars($resolved);
             // scp/tickets.php:200 — $alert is true unless reply-to is none.
             // Claim stays at the method default (true): native auto-claim.
             $alert = strcasecmp('none', $resolved['reply_to']);
+            $this->dropOwnerDirty($ticket);
             $response = $ticket->postReply($vars, $errors, $alert);
-            if (!$response) {
-                $msg = isset($errors['err']) ? $errors['err']
-                    : (isset($errors['response']) ? $errors['response'] : 'Unable to post the reply.');
-                $this->fail('invalid_option', $msg, 400);
+            $responseId = ($response && $response->getId()) ? (int) $response->getId() : 0;
+            // A throw, or a call that returns nothing, is not success. Record
+            // a response row when one landed, and leave the note for a retry.
+            if (!$responseId) {
+                $found = $this->findResponseSince($ticket, $staff->getId(), $baseline);
+                if ($found) {
+                    $this->ledgerMarkReply($requestId, $found);
+                    $this->fail('partial_note_missing',
+                        'The reply was saved but the internal note was not.',
+                        500, array('response_entry_id' => (int) $found));
+                }
+                $this->fail('reply_state_unknown',
+                    'The reply did not return an entry and none was found after it started.',
+                    500, array('response_entry_id' => null));
             }
 
-            // The reply is saved. A later failure must not drop the ledger
-            // row, or a replay would post a second reply.
-            $this->rollbackRequest = null;
+            $this->ledgerMarkReply($requestId, $responseId);
+            if ($this->testFault() === 'after_reply')
+                throw new WgsReplyBridgeFault('after_reply');
 
-            $note = $this->postBridgeNote($ticket, $staff, $summary);
-            if (!$note)
-                $note = $this->postBridgeNote($ticket, $staff, $summary);
-
-            // scp/tickets.php:233-238
-            $ticket->releaseLock($staff->getId());
-            $lock = null;
-            Draft::deleteForNamespace('ticket.response.' . $ticket->getId(), $staff->getId());
-
-            $fresh = Ticket::lookup($ticket->getId());
-            $payload = $this->sendPayload($fresh ?: $ticket, $response, $note);
-            $json = $this->encode($payload);
-            $this->ledgerComplete($requestId, $response->getId(),
-                $note ? $note->getId() : 0, $json);
-            Http::response(200, $json, 'application/json');
+            $this->finishNote($ticket, $staff, $summary, $responseId, $response);
+        } catch (WgsReplyBridgeFault $ex) {
+            $row = $this->ledgerFetch($requestId);
+            $responseId = ($row && $row['response_entry_id']) ? (int) $row['response_entry_id'] : 0;
+            if (!$responseId && $row)
+                $responseId = $this->findResponseSince($ticket, $staff->getId(), (int) $row['baseline_entry_id']);
+            if ($responseId)
+                $this->ledgerMarkReply($requestId, $responseId);
+            $this->fail('partial_note_missing',
+                'The reply was saved but the internal note was not.',
+                500, array('response_entry_id' => $responseId ? (int) $responseId : null));
         } catch (Throwable $ex) {
-            if ($lock)
-                $ticket->releaseLock($staff->getId());
+            $row = $this->ledgerFetch($requestId);
+            $responseId = 0;
+            if ($row && $row['status'] == 'executing'
+                    && $row['baseline_entry_id'] !== null && $row['baseline_entry_id'] !== '')
+                $responseId = $this->findResponseSince($ticket, $staff->getId(), (int) $row['baseline_entry_id']);
+            elseif ($row && $row['response_entry_id'])
+                $responseId = (int) $row['response_entry_id'];
+            if ($responseId) {
+                $this->ledgerMarkReply($requestId, $responseId);
+                $this->fail('partial_note_missing',
+                    'The reply was saved but the internal note was not.',
+                    500, array('response_entry_id' => (int) $responseId));
+            }
+            if ($row && $row['status'] == 'executing') {
+                $this->fail('reply_state_unknown',
+                    'The reply did not return an entry and none was found after it started.',
+                    500, array('response_entry_id' => null));
+            }
             $this->fail('invalid_option', 'Unable to post the reply.', 500);
         }
     }
@@ -162,19 +233,22 @@ class WgsReplyBridgePlugin extends Plugin {
         if (!$cfg || !$cfg->get('enabled'))
             $this->fail('auth_failed', 'Reply bridge is disabled.', 403);
 
-        $max = (int) $cfg->get('max_body_bytes');
-        if ($max < 1)
-            $max = 8388608;
-        $raw = file_get_contents('php://input');
-        if ($raw === false)
-            $raw = '';
-        if (strlen($raw) > $max)
-            $this->fail('invalid_option', 'Request body is too large.', 413);
-
+        // IP before the body. A rejected host must not be able to make us
+        // buffer a large request.
         $ip = osTicket::get_client_ip();
         $allowed = preg_split('/\s*,\s*/', (string) $cfg->get('allowed_ips'), -1, PREG_SPLIT_NO_EMPTY);
         if (!$ip || !Validator::check_ip($ip, $allowed))
             $this->fail('ip_not_allowed', 'Source address is not allowed.', 403);
+
+        $max = (int) $cfg->get('max_body_bytes');
+        if ($max < 1)
+            $max = 8388608;
+        $declared = isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : 0;
+        if ($declared > $max)
+            $this->fail('invalid_option', 'Request body is too large.', 413);
+        $raw = $this->readBody($max);
+        if ($raw === false)
+            $this->fail('invalid_option', 'Request body is too large.', 413);
 
         $stamp = isset($_SERVER['HTTP_X_WGS_TIMESTAMP']) ? $_SERVER['HTTP_X_WGS_TIMESTAMP'] : '';
         $rid = isset($_SERVER['HTTP_X_WGS_REQUEST_ID']) ? $_SERVER['HTTP_X_WGS_REQUEST_ID'] : '';
@@ -205,6 +279,36 @@ class WgsReplyBridgePlugin extends Plugin {
 
     function requestId() {
         return (string) $_SERVER['HTTP_X_WGS_REQUEST_ID'];
+    }
+
+    /**
+     * Read at most $max + 1 bytes. false means the body exceeded $max.
+     * CONTENT_LENGTH is rejected before this is called.
+     */
+    function readBody($max) {
+        $fh = fopen('php://input', 'rb');
+        if (!$fh)
+            return '';
+        $raw = '';
+        $limit = $max + 1;
+        while (!feof($fh) && strlen($raw) < $limit) {
+            $chunk = fread($fh, $limit - strlen($raw));
+            if ($chunk === false || $chunk === '')
+                break;
+            $raw .= $chunk;
+        }
+        fclose($fh);
+        if (strlen($raw) > $max)
+            return false;
+        return $raw;
+    }
+
+    function testFault() {
+        $cfg = $this->config();
+        $flag = $cfg ? (string) $cfg->get('test_fault') : '';
+        if ($flag === 'after_reply' || $flag === 'note_fail')
+            return $flag;
+        return '';
     }
 
     // ---- staff and ticket -------------------------------------------------
@@ -741,6 +845,34 @@ class WgsReplyBridgePlugin extends Plugin {
     // ---- preview ----------------------------------------------------------
 
     function buildPreview($ticket, $staff, array $resolved) {
+        $facts = $this->replyFacts($ticket, $staff, $resolved);
+        return array(
+            'to' => $facts['to'],
+            'cc' => $facts['cc'],
+            'from' => array(
+                'email_id' => $facts['email_id'],
+                // Email::getAddress() is the dropdown label "Name <email>"
+                // (class.email.php:116). The mailer sends getEmail() and the
+                // display name separately (class.mailer.php setFromAddress).
+                'address' => $facts['from_address'],
+                'name' => $facts['from_name'],
+            ),
+            'signature' => $facts['signature'],
+            'status_after' => $facts['status_after'],
+            'auto_claim' => $facts['auto_claim'],
+            'subject' => $facts['subject'],
+            'body' => $facts['body'],
+            'preview_hash' => $this->makePreviewHash($ticket, $staff, $resolved, $facts),
+        );
+    }
+
+    /**
+     * Everything preview shows and everything the preview hash binds,
+     * from one pass. Recipients are the proposed collaborator set, not
+     * the flags currently stored. The rendered subject and body use an
+     * in-memory copy of the post-reply status and assignee.
+     */
+    function replyFacts($ticket, $staff, array $resolved) {
         global $cfg;
 
         $dept = $ticket->getDept();
@@ -778,55 +910,76 @@ class WgsReplyBridgePlugin extends Plugin {
         if ($fromName === '' && $email)
             $fromName = (string) $email->getName();
 
-        $recipients = $this->recipientLists($ticket, $resolved);
-        $rendered = $this->renderReply($ticket, $staff, $dept, $resolved, $signature, $recipients['list']);
         $status = TicketStatus::lookup($resolved['reply_status_id']);
         if (!$status)
             $status = $ticket->getStatus();
 
-        $hash = $this->makePreviewHash($ticket, $staff, $resolved);
+        // Captured before the projection. These are the live ticket, not
+        // the status the reply is about to apply.
+        $recipients = $this->proposedRecipients($ticket, $resolved);
+        $live = array(
+            'last_entry_id' => $this->lastEntryId($ticket),
+            'status_id' => (int) $ticket->getStatusId(),
+            'owner_id' => (int) $ticket->getOwnerId(),
+            'auto_claim' => $this->wouldAutoClaim($ticket, $status),
+        );
+        $rendered = $this->renderReply($ticket, $staff, $dept, $resolved, $signature, $recipients['list']);
+
         return array(
             'to' => $recipients['to'],
             'cc' => $recipients['cc'],
-            'from' => array(
-                'email_id' => $email ? (int) $email->getId() : 0,
-                // Email::getAddress() is the dropdown label "Name <email>"
-                // (class.email.php:116). The mailer sends getEmail() and the
-                // display name separately (class.mailer.php setFromAddress).
-                'address' => $email ? (string) $email->getEmail() : '',
-                'name' => $fromName,
-            ),
+            'email_id' => $email ? (int) $email->getId() : 0,
+            'from_address' => $email ? (string) $email->getEmail() : '',
+            'from_name' => $fromName,
             'signature' => $signature,
             'status_after' => array(
                 'id' => $status ? (int) $status->getId() : 0,
                 'name' => $status ? (string) $status->getName() : '',
                 'state' => $status ? (string) $status->getState() : '',
             ),
-            'auto_claim' => $this->wouldAutoClaim($ticket, $status),
+            'auto_claim' => $live['auto_claim'],
             'subject' => $rendered['subject'],
             'body' => $rendered['body'],
-            'preview_hash' => $hash,
+            'last_entry_id' => $live['last_entry_id'],
+            'status_id' => $live['status_id'],
+            'owner_id' => $live['owner_id'],
         );
     }
 
-    function recipientLists($ticket, array $resolved) {
+    /**
+     * Recipients after applyCollaborators, without writing that change.
+     * An explicit empty cc_user_ids deactivates every collaborator, so
+     * the Cc list is empty. A selected collaborator is included even
+     * when the stored row is inactive: send activates it first.
+     * getRecipients() cannot express either case before the write.
+     */
+    function proposedRecipients($ticket, array $resolved) {
         $to = array();
         $cc = array();
-        $list = null;
+        $list = new MailingList();
         if ($resolved['reply_to'] !== 'none') {
-            // Ticket::getRecipients. Whitelist is the ccs[] the controller
-            // will have applied. class.ticket.php lines 960-981.
-            $list = $ticket->getRecipients($resolved['reply_to'], $resolved['ccs']);
-            if ($list instanceof MailingList) {
-                foreach ($list->getEmailAddresses() as $type => $rows) {
-                    if (!is_array($rows))
-                        continue;
-                    foreach ($rows as $addr) {
-                        if ($type == 'cc')
-                            $cc[] = (string) $addr;
-                        else
-                            $to[] = (string) $addr;
+            $owner = $ticket->getOwner();
+            if ($owner && ($resolved['reply_to'] === 'user' || $resolved['reply_to'] === 'all'))
+                $list->addTo($owner);
+            if ($resolved['reply_to'] === 'all') {
+                $wanted = array();
+                foreach ($resolved['ccs'] as $id)
+                    $wanted[(int) $id] = true;
+                if ($wanted && ($collabs = $ticket->getCollaborators())) {
+                    foreach ($collabs as $c) {
+                        if (isset($wanted[(int) $c->getUserId()]))
+                            $list->addCc($c);
                     }
+                }
+            }
+            foreach ($list->getEmailAddresses() as $type => $rows) {
+                if (!is_array($rows))
+                    continue;
+                foreach ($rows as $addr) {
+                    if ($type == 'cc')
+                        $cc[] = (string) $addr;
+                    else
+                        $to[] = (string) $addr;
                 }
             }
         }
@@ -856,12 +1009,17 @@ class WgsReplyBridgePlugin extends Plugin {
             $stored = '-';
         $stored = Format::stripExternalImages($stored);
 
+        // postReply renders the template after setStatus and auto-claim.
+        // Project those onto a clone. Writing them onto the live ticket
+        // makes the real setStatus see "already closed" and skip the save.
+        $projected = clone $ticket;
+        $this->projectPostReply($projected, $staff, $resolved);
         $variables = array(
             'response' => new WgsReplyPreviewEntry($stored, $entryBody->getType()),
             'signature' => $signature,
             'staff' => $staff,
             'poster' => $staff,
-            'recipient' => $ticket->getOwner(),
+            'recipient' => $projected->getOwner(),
         );
         if ($recipients instanceof MailingList
                 && count($recipients) == 1
@@ -870,68 +1028,100 @@ class WgsReplyBridgePlugin extends Plugin {
                 && ($contact instanceof TicketOwner))
             $variables['recipient.ticket_link'] = $contact->getTicketLink();
 
-        $rendered = $ticket->replaceVars($msg->asArray(), $variables);
+        $rendered = $projected->replaceVars($msg->asArray(), $variables);
         return array(
             'subject' => isset($rendered['subj']) ? (string) $rendered['subj'] : '',
             'body' => isset($rendered['body']) ? (string) $rendered['body'] : '',
         );
     }
 
-    function previewMaterial($ticket, $staff, array $resolved, $iat) {
-        $files = array();
-        foreach ($resolved['attachments'] as $file) {
-            $files[] = $file['name'] . ':' . $file['sha256'];
+    /**
+     * In-memory stand-in for setStatus plus the auto-claim inside postReply.
+     * Nothing here saves. Closed assigns the acting agent (setStatus lines
+     * 1528-1529). Reopen assigns the prior agent or clears it (lines
+     * 1538-1554). Claim then runs only when the result is open and unassigned.
+     */
+    function projectPostReply($ticket, $staff, array $resolved) {
+        $status = TicketStatus::lookup((int) $resolved['reply_status_id']);
+        if (!$status)
+            return;
+        $claim = $this->wouldAutoClaim($ticket, $status);
+        if ((int) $status->getId() !== (int) $ticket->getStatusId()) {
+            if ($status->getState() == 'closed') {
+                $ticket->status = $status;
+                $ticket->staff = $staff;
+            }
+            elseif ($status->getState() == 'open' && $ticket->isClosed() && $ticket->isReopenable()) {
+                $dept = $ticket->getDept();
+                $prior = $ticket->getStaff() ?: $ticket->getLastRespondent();
+                $autoassign = ($dept && !$dept->disableReopenAutoAssign());
+                if ($autoassign && $prior && $prior->isAvailable() && $prior->canAccessDept($dept))
+                    $ticket->staff = $prior;
+                else
+                    $ticket->staff = null;
+                $ticket->status = $status;
+            }
+            else {
+                $ticket->status = $status;
+            }
         }
+        if ($claim)
+            $ticket->staff = $staff;
+    }
+
+    function previewMaterial($ticket, $staff, array $resolved, $iat, array $facts) {
+        $to = $facts['to'];
+        $cc = $facts['cc'];
+        sort($to);
+        sort($cc);
+        $files = array();
+        foreach ($resolved['attachments'] as $file)
+            $files[] = $file['name'] . ':' . $file['type'] . ':' . $file['sha256'];
         sort($files);
-        $ccs = $resolved['ccs'];
+        $ccs = array();
+        foreach ($resolved['ccs'] as $id)
+            $ccs[] = (int) $id;
         sort($ccs);
-        $state = $this->ticketState($ticket);
+        $ccText = array();
+        foreach ($ccs as $id)
+            $ccText[] = (string) $id;
+        // Length-prefixed fields. A newline inside the rendered body must
+        // not be readable as the next field.
         $lines = array(
-            'v1',
-            (string) (int) $staff->getId(),
-            (string) (int) $ticket->getId(),
-            (string) $state['last_entry_id'],
-            (string) $state['status_id'],
-            $state['collaborators'],
-            hash('sha256', $resolved['response_html']),
-            $resolved['signature'],
-            $resolved['reply_to'],
-            $resolved['cc_omitted'] ? '*' : implode(',', $ccs),
-            (string) (int) $resolved['from_email_id'],
-            (string) (int) $resolved['reply_status_id'],
-            implode(',', $files),
-            (string) (int) $iat,
+            'v2',
+            $this->materialField((int) $staff->getId()),
+            $this->materialField((int) $ticket->getId()),
+            $this->materialField((int) $facts['last_entry_id']),
+            $this->materialField((int) $facts['status_id']),
+            $this->materialField((int) $facts['owner_id']),
+            $this->materialField(implode(',', $to)),
+            $this->materialField(implode(',', $cc)),
+            $this->materialField((int) $facts['email_id']),
+            $this->materialField($facts['from_address']),
+            $this->materialField($facts['from_name']),
+            $this->materialField($facts['signature']),
+            $this->materialField($facts['subject']),
+            $this->materialField($facts['body']),
+            $this->materialField($resolved['reply_to']),
+            $this->materialField((int) $resolved['reply_status_id']),
+            $this->materialField(implode(',', $ccText)),
+            $this->materialField(implode(',', $files)),
+            $this->materialField((int) $iat),
         );
         return implode("\n", $lines);
     }
 
-    function ticketState($ticket) {
-        $lastId = 0;
-        $row = ThreadEntry::objects()
-            ->filter(array('thread_id' => $ticket->getThreadId()))
-            ->order_by('-id')
-            ->values_flat('id')
-            ->first();
-        if ($row)
-            $lastId = (int) $row[0];
-
-        $collabs = array();
-        if ($list = $ticket->getCollaborators()) {
-            foreach ($list as $c)
-                $collabs[] = (int) $c->getUserId() . ':' . ($c->isActive() ? '1' : '0');
-        }
-        sort($collabs);
-        return array(
-            'last_entry_id' => $lastId,
-            'status_id' => (int) $ticket->getStatusId(),
-            'collaborators' => implode(',', $collabs),
-        );
+    function materialField($value) {
+        $value = (string) $value;
+        return strlen($value) . ':' . $value;
     }
 
-    function makePreviewHash($ticket, $staff, array $resolved) {
+    function makePreviewHash($ticket, $staff, array $resolved, array $facts=null) {
+        if ($facts === null)
+            $facts = $this->replyFacts($ticket, $staff, $resolved);
         $secret = (string) $this->config()->get('shared_secret');
         $iat = time();
-        $mac = hash_hmac('sha256', $this->previewMaterial($ticket, $staff, $resolved, $iat), $secret);
+        $mac = hash_hmac('sha256', $this->previewMaterial($ticket, $staff, $resolved, $iat, $facts), $secret);
         return $iat . '.' . $mac;
     }
 
@@ -943,7 +1133,8 @@ class WgsReplyBridgePlugin extends Plugin {
         if ($iat > time() + 60 || (time() - $iat) > self::PREVIEW_TTL)
             $this->fail('stale_preview', 'preview_hash has expired.', 409);
         $secret = (string) $this->config()->get('shared_secret');
-        $expect = hash_hmac('sha256', $this->previewMaterial($ticket, $staff, $resolved, $iat), $secret);
+        $facts = $this->replyFacts($ticket, $staff, $resolved);
+        $expect = hash_hmac('sha256', $this->previewMaterial($ticket, $staff, $resolved, $iat, $facts), $secret);
         if (!hash_equals($expect, $m[2]))
             $this->fail('stale_preview', 'The ticket changed since preview, or the reply fields do not match.', 409);
     }
@@ -1020,12 +1211,25 @@ class WgsReplyBridgePlugin extends Plugin {
      * not call setStatus. No claim.
      */
     function postBridgeNote($ticket, $staff, $summary) {
-        $text = 'Reply sent using Claude by ' . (string) $staff->getName()
-            . "\n\n" . $summary;
+        // Staging fault. Production config leaves test_fault empty, and
+        // any other value is ignored, so this returns before postNote
+        // only when that flag is exactly note_fail.
+        if ($this->testFault() === 'note_fail')
+            return false;
+        $text = $this->noteText($staff, $summary);
         $errors = array();
         return $ticket->postNote(array(
             'note' => new TextThreadEntryBody($text),
         ), $errors, $staff, false);
+    }
+
+    function noteText($staff, $summary) {
+        return 'Reply sent using Claude by ' . (string) $staff->getName()
+            . "\n\n" . $summary;
+    }
+
+    function noteFirstLine($staff) {
+        return 'Reply sent using Claude by ' . (string) $staff->getName();
     }
 
     function sendPayload($ticket, $response, $note) {
@@ -1064,25 +1268,50 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     function ledgerFetch($requestId) {
-        $sql = 'SELECT status, result_json, response_entry_id, note_entry_id FROM '
+        $sql = 'SELECT request_id, ticket_id, staff_id, status, result_json,'
+            . ' response_entry_id, note_entry_id, baseline_entry_id, executing_at FROM '
             . $this->ledgerTable() . ' WHERE request_id=' . db_input($requestId);
         if (!($res = db_query($sql)) || !db_num_rows($res))
             return null;
         return db_fetch_array($res);
     }
 
-    function ledgerInsert($requestId, $ticketId, $staffId) {
+    function ledgerInsert($requestId, $ticketId, $staffId, $status) {
         $sql = 'INSERT INTO ' . $this->ledgerTable()
             . ' (request_id, ticket_id, staff_id, status, created)'
             . ' VALUES (' . db_input($requestId) . ',' . db_input((int) $ticketId)
-            . ',' . db_input((int) $staffId) . ',' . db_input('started') . ', NOW())';
-        return (bool) db_query($sql);
+            . ',' . db_input((int) $staffId) . ',' . db_input($status) . ', NOW())';
+        if (!db_query($sql))
+            $this->fail('already_done', 'This request id is already in use.', 409);
     }
 
-    function ledgerDelete($requestId) {
-        db_query('DELETE FROM ' . $this->ledgerTable()
+    function ledgerMarkExecuting($requestId, $baseline) {
+        $sql = 'UPDATE ' . $this->ledgerTable()
+            . ' SET status=' . db_input('executing')
+            . ', executing_at=' . db_input(time())
+            . ', baseline_entry_id=' . db_input((int) $baseline)
             . ' WHERE request_id=' . db_input($requestId)
-            . ' AND status=' . db_input('started'));
+            . ' AND status=' . db_input('reserved');
+        db_query($sql);
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || $row['status'] !== 'executing')
+            $this->fail('already_done', 'This request id cannot be posted again.', 409);
+    }
+
+    function ledgerMarkReply($requestId, $responseId) {
+        $sql = 'UPDATE ' . $this->ledgerTable()
+            . ' SET status=' . db_input('reply_recorded')
+            . ', response_entry_id=' . db_input((int) $responseId)
+            . ' WHERE request_id=' . db_input($requestId)
+            . ' AND status IN (' . db_input('executing') . ',' . db_input('reply_recorded') . ')';
+        db_query($sql);
+        $row = $this->ledgerFetch($requestId);
+        // scp/tickets.php:233-238. The reply is saved, so the composer's
+        // draft for this agent is cleared even when the note is still owed.
+        if ($row && $row['status'] === 'reply_recorded' && $row['ticket_id'] && $row['staff_id'])
+            Draft::deleteForNamespace(
+                'ticket.response.' . (int) $row['ticket_id'],
+                (int) $row['staff_id']);
     }
 
     function ledgerComplete($requestId, $responseId, $noteId, $json) {
@@ -1090,7 +1319,8 @@ class WgsReplyBridgePlugin extends Plugin {
             . ', response_entry_id=' . db_input((int) $responseId)
             . ', note_entry_id=' . db_input((int) $noteId)
             . ', result_json=' . db_input($json)
-            . ' WHERE request_id=' . db_input($requestId);
+            . ' WHERE request_id=' . db_input($requestId)
+            . ' AND status=' . db_input('reply_recorded');
         db_query($sql);
     }
 
@@ -1105,24 +1335,25 @@ class WgsReplyBridgePlugin extends Plugin {
         $this->respond(200, $this->encode($data));
     }
 
-    function fail($error, $message, $http) {
-        if ($this->rollbackRequest) {
-            $id = $this->rollbackRequest;
-            $this->rollbackRequest = null;
-            $this->ledgerDelete($id);
-        }
-        $this->respond($http, $this->encode(array(
+    function fail($error, $message, $http, $extra=array()) {
+        $body = array(
             'ok' => false,
             'error' => $error,
             'message' => $message,
-        )));
+        );
+        if ($extra)
+            $body = $body + $extra;
+        $this->respond($http, $this->encode($body));
     }
 
     /**
      * Http::header_code_verbose() (class.http.php:18) has no 409 or 413.
      * Any code missing from that switch is sent as 500.
+     * Locks are released here because every exit goes through this method.
      */
     function respond($http, $content) {
+        $this->releaseNative();
+        $this->advisoryRelease();
         if ($http == 409 || $http == 413) {
             $verbose = ($http == 409) ? '409 Conflict' : '413 Payload Too Large';
             header('HTTP/1.1 ' . $verbose);
@@ -1134,6 +1365,226 @@ class WgsReplyBridgePlugin extends Plugin {
         }
         Http::response($http, $content, 'application/json');
     }
+
+    // ---- locks and ledger resume -----------------------------------------
+
+    function advisoryAcquire($ticketId) {
+        $name = 'wgs_reply_' . (int) $ticketId;
+        $sql = 'SELECT GET_LOCK(' . db_input($name) . ',' . (int) self::ADVISORY_WAIT . ')';
+        $got = db_result(db_query($sql));
+        if ($got != 1)
+            $this->fail('busy', 'Another reply is already being posted on this ticket.', 409);
+        $this->advisoryName = $name;
+    }
+
+    function advisoryRelease() {
+        if (!$this->advisoryName)
+            return;
+        $name = $this->advisoryName;
+        $this->advisoryName = null;
+        db_query('SELECT RELEASE_LOCK(' . db_input($name) . ')');
+    }
+
+    function nativeLock($ticket, $staff) {
+        $lock = $this->acquireLock($ticket, $staff);
+        if ($lock) {
+            $this->nativeLockTicket = $ticket;
+            $this->nativeLockStaffId = (int) $staff->getId();
+        }
+    }
+
+    function releaseNative() {
+        $ticket = $this->nativeLockTicket;
+        $staffId = $this->nativeLockStaffId;
+        $this->nativeLockTicket = null;
+        $this->nativeLockStaffId = 0;
+        if ($ticket)
+            $ticket->releaseLock($staffId);
+    }
+
+    /**
+     * The ticket object was loaded before GET_LOCK. Another request may
+     * have committed while this one waited. Overwrite the scalar columns
+     * and drop the joined objects so the next read comes from the database.
+     */
+    function reloadTicket($ticket) {
+        $rows = Ticket::objects()
+            ->filter(array('ticket_id' => $ticket->getId()))
+            ->values('status_id', 'staff_id', 'user_id', 'team_id', 'lock_id')
+            ->limit(1)
+            ->all();
+        if ($rows) {
+            foreach (array('status_id', 'staff_id', 'user_id', 'team_id', 'lock_id') as $field) {
+                if (array_key_exists($field, $rows[0]))
+                    $ticket->ht[$field] = $rows[0][$field];
+            }
+        }
+        $ticket->dirty = array();
+        unset($ticket->ht['status'], $ticket->ht['staff'], $ticket->ht['user'],
+            $ticket->ht['team'], $ticket->ht['lock']);
+        // owner is a declared property. unset() on it makes every later
+        // write go through __set, which records a non-column `owner` in
+        // $dirty. The next ticket UPDATE then fails. Null it instead so
+        // getOwner() rebuilds a TicketOwner without dirtying the row.
+        if (array_key_exists('owner', get_object_vars($ticket)))
+            $ticket->owner = null;
+        unset($ticket->ht['owner']);
+        $this->dropOwnerDirty($ticket);
+        $thread = $ticket->getThread();
+        if ($thread) {
+            $thread->_collaborators = null;
+            unset($thread->ht['active_collaborators']);
+        }
+    }
+
+    /**
+     * getOwner() can land a TicketOwner in $dirty under the key `owner`.
+     * That is not a column. Leave the cached owner in place so the next
+     * getOwner() does not assign, and dirty, again.
+     */
+    function dropOwnerDirty($ticket) {
+        unset($ticket->dirty['owner']);
+    }
+
+    /**
+     * Thread::getEntry() calls ThreadEntry::lookup($id, $threadId). The
+     * primary key is only id, so the extra argument becomes an empty
+     * column and the query throws. Look the entry up by its id instead.
+     */
+    function responseEntry($ticket, $responseId) {
+        $entry = ThreadEntry::lookup((int) $responseId);
+        if (!$entry || (int) $entry->getThreadId() !== (int) $ticket->getThreadId())
+            return null;
+        return $entry;
+    }
+
+    function lastEntryId($ticket) {
+        $row = ThreadEntry::objects()
+            ->filter(array('thread_id' => $ticket->getThreadId()))
+            ->order_by('-id')
+            ->values_flat('id')
+            ->first();
+        return $row ? (int) $row[0] : 0;
+    }
+
+    function findResponseSince($ticket, $staffId, $baseline) {
+        $row = ThreadEntry::objects()
+            ->filter(array(
+                'thread_id' => $ticket->getThreadId(),
+                'type' => 'R',
+                'staff_id' => (int) $staffId,
+                'id__gt' => (int) $baseline,
+            ))
+            ->order_by('id')
+            ->values_flat('id')
+            ->first();
+        return $row ? (int) $row[0] : 0;
+    }
+
+    /**
+     * A later note whose first line is the bridge line for this response.
+     * The retry may carry a different summary; the first line is the check.
+     */
+    function findBridgeNote($ticket, $staff, $responseId) {
+        $want = $this->noteFirstLine($staff);
+        $wantHtml = Format::htmlchars($want);
+        $entries = ThreadEntry::objects()
+            ->filter(array(
+                'thread_id' => $ticket->getThreadId(),
+                'type' => 'N',
+                'staff_id' => (int) $staff->getId(),
+                'id__gt' => (int) $responseId,
+            ))
+            ->order_by('id');
+        foreach ($entries as $entry) {
+            $flat = str_replace(array("\r\n", "\r"), "\n", (string) $entry->body);
+            $line = rtrim(substr($flat, 0, strcspn($flat, "\n")));
+            $plain = trim(strip_tags($line));
+            if ($line === $want || $line === $wantHtml || $plain === $want || $plain === $wantHtml)
+                return $entry;
+        }
+        return null;
+    }
+
+    /**
+     * reply_recorded posts only the note. executing looks for the response
+     * that landed after the baseline and, when it finds one, does the same.
+     * Neither path calls postReply. The acting agent is the ledger row's
+     * staff, not whoever presented this request id.
+     */
+    function resumeLedger($ticket, $staff, $summary, array $row) {
+        global $thisstaff;
+
+        $actor = Staff::lookup((int) $row['staff_id']);
+        if (!$actor)
+            $this->fail('staff_not_found', 'Staff member was not found.', 404);
+        $staff = $actor;
+        $thisstaff = $actor;
+        $requestId = $this->requestId();
+        $responseId = (int) $row['response_entry_id'];
+        if ($row['status'] == 'executing') {
+            if ($row['baseline_entry_id'] === null || $row['baseline_entry_id'] === '') {
+                $this->fail('reply_state_unknown',
+                    'The reply did not return an entry and none was found after it started.',
+                    500, array('response_entry_id' => null));
+            }
+            $responseId = $this->findResponseSince(
+                $ticket, (int) $actor->getId(), (int) $row['baseline_entry_id']);
+            if (!$responseId) {
+                $this->fail('reply_state_unknown',
+                    'The reply did not return an entry and none was found after it started.',
+                    500, array('response_entry_id' => null));
+            }
+            $this->ledgerMarkReply($requestId, $responseId);
+        }
+        if (!$responseId) {
+            $this->fail('reply_state_unknown',
+                'The reply did not return an entry and none was found after it started.',
+                500, array('response_entry_id' => null));
+        }
+        $response = $this->responseEntry($ticket, $responseId);
+        $this->finishNote($ticket, $staff, $summary, $responseId, $response);
+        $this->fail('invalid_option', 'Unable to finish the saved reply.', 500);
+    }
+
+    function finishNote($ticket, $staff, $summary, $responseId, $response) {
+        $requestId = $this->requestId();
+        $existing = $this->findBridgeNote($ticket, $staff, $responseId);
+        if ($existing) {
+            $this->completeSend($ticket, $response, $existing, $requestId, $responseId);
+        }
+        if (trim($summary) === '')
+            $this->fail('empty_summary', 'note_summary is required.', 400);
+        if ($this->testFault() === 'note_fail') {
+            $this->fail('partial_note_missing',
+                'The reply was saved but the internal note was not.',
+                500, array('response_entry_id' => (int) $responseId));
+        }
+        $note = $this->postBridgeNote($ticket, $staff, $summary);
+        if (!$note || !$note->getId()) {
+            $this->fail('partial_note_missing',
+                'The reply was saved but the internal note was not.',
+                500, array('response_entry_id' => (int) $responseId));
+        }
+        $this->completeSend($ticket, $response, $note, $requestId, $responseId);
+    }
+
+    function completeSend($ticket, $response, $note, $requestId, $responseId) {
+        $this->reloadTicket($ticket);
+        if (!$response || !$response->getId())
+            $response = $this->responseEntry($ticket, $responseId);
+        $json = $this->encode($this->sendPayload($ticket, $response, $note));
+        $this->ledgerComplete($requestId, $responseId, (int) $note->getId(), $json);
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || $row['status'] !== 'completed')
+            $this->fail('partial_note_missing',
+                'The reply was saved but the internal note was not.',
+                500, array('response_entry_id' => (int) $responseId));
+        $this->respond(200, $json);
+    }
+}
+
+class WgsReplyBridgeFault extends RuntimeException {
 }
 
 /**

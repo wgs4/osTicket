@@ -32,6 +32,15 @@ class WgsReplyBridgeConfig extends PluginConfig {
                 'hint' => 'Reject a request body larger than this many bytes.',
                 'configuration' => array('size' => 12, 'length' => 12),
             )),
+            // Staging tests only. Production leaves this empty. The bridge
+            // ignores every value except the two fault names below.
+            'test_fault' => new TextboxField(array(
+                'label' => 'Test fault',
+                'required' => false,
+                'default' => '',
+                'hint' => 'Leave empty in production. Staging may set after_reply or note_fail.',
+                'configuration' => array('size' => 20, 'length' => 32),
+            )),
         );
     }
 }

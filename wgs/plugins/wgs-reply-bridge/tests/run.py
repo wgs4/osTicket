@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -64,6 +65,12 @@ def deploy():
     if lint.returncode != 0:
         raise SystemExit(lint.stdout + lint.stderr)
     say(lint.stdout.strip())
+    # Apache keeps its own opcache. A graceful reload picks up the rsync.
+    subprocess.run(
+        ["docker", "exec", "osticket_staging_web", "apachectl", "graceful"],
+        capture_output=True, text=True,
+    )
+    time.sleep(2)
 
 
 def sign(secret, method, path, body, ts, rid):
@@ -272,6 +279,8 @@ def main():
     deploy()
     installed = ctl(["install", ALLOWED])
     say("install %s" % json.dumps({k: installed[k] for k in installed if k != "ok"}))
+    ctl(["set-fault", "off"])
+    ctl(["set-max", "8388608"])
     SECRET = ctl(["secret"], secret=True)
     if len(SECRET) < 16:
         raise SystemExit("secret looks too short")
@@ -307,6 +316,13 @@ def main():
     check_8(staff, tickets["silent"])
     check_9(staff, tickets["collab"])
     check_10(staff, tickets["stale"])
+    check_race(staff, tickets["race"])
+    check_fault_after_reply(staff, tickets["fault_reply"])
+    check_fault_note(staff, tickets["fault_note"])
+    check_recipients(staff, tickets["collab"])
+    check_owner_stale(staff, tickets["owner"])
+    check_no_access_options(fx["no_access_staff"], staff, tickets["no_access"])
+    check_oversize(staff, tickets["plain"])
 
     say("")
     failed = [name for name, ok, _detail in results if not ok]
@@ -713,6 +729,441 @@ def check_10(staff, ticket):
         detail += "\n" + sent["raw"][:400]
         detail += "\ncounts %s -> %s" % (before["counts"], after["counts"])
     record("10 stale preview after a new customer message", ok, detail)
+
+
+def bracket_addr(value):
+    match = re.search(r"<([^>]+)>", value or "")
+    text = match.group(1) if match else (value or "")
+    return text.strip().lower()
+
+
+# Fixed denial sentences. A short ticket subject that happens to sit inside
+# one of these is not a leaked ticket fact.
+DENIAL_TEXT = (
+    "staff member cannot access this ticket.",
+    "a merged child ticket cannot be replied to.",
+    "ticket was not found.",
+)
+
+
+def denial_is_empty(response, banned):
+    body = response["json"]
+    if response["code"] not in (403, 404) or not body:
+        return "HTTP %s %s" % (response["code"], response["raw"][:300])
+    if set(body.keys()) - {"ok", "error", "message"}:
+        return "extra keys %s" % sorted(body.keys())
+    raw = response["raw"].lower()
+    for secret in banned:
+        if not secret:
+            continue
+        low = secret.lower()
+        if any(low in sentence for sentence in DENIAL_TEXT):
+            continue
+        if low in raw:
+            return "denial contains %s" % secret
+    return ""
+
+
+def check_race(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    marker = "Bridge race %s" % uuid.uuid4().hex[:12]
+    fields = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>%s</p>" % marker,
+    }
+    preview = post("preview", fields)
+    if preview["code"] != 200 or not preview["json"] or not preview["json"].get("ok"):
+        record("11 one reply wins a concurrent send", False,
+               "preview failed %s" % preview["raw"][:400])
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    fields["note_summary"] = "Two sends raced. Only one reply may land."
+    barrier = threading.Barrier(2)
+    out = [None, None]
+
+    def shoot(index):
+        try:
+            barrier.wait(timeout=30)
+            out[index] = post("send", fields)
+        except Exception as exc:
+            out[index] = {"code": 0, "raw": str(exc), "json": None}
+
+    threads = [threading.Thread(target=shoot, args=(i,)) for i in (0, 1)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=90)
+    problems = []
+    if any(item is None for item in out):
+        problems.append("a sender did not finish")
+    else:
+        wins = [item for item in out if item["json"] and item["json"].get("ok")]
+        losses = [item for item in out if item not in wins]
+        if len(wins) != 1:
+            problems.append("successes %s" % len(wins))
+        for item in losses:
+            code = (item["json"] or {}).get("error")
+            if item["code"] != 409 or code not in ("busy", "stale_preview"):
+                problems.append("loser %s %s" % (item["code"], item["raw"][:300]))
+    entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+    replies = [entry for entry in entries if entry["type"] == "R"]
+    if len(replies) != 1:
+        problems.append("R entries %s" % len(replies))
+    detail = "ticket %s replies %s" % (ticket["number"], len(replies))
+    if not any(item is None for item in out):
+        detail += " results %s" % ", ".join(
+            "%s %s" % (item["code"], (item["json"] or {}).get("error") or "ok")
+            for item in out)
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("11 one reply wins a concurrent send", not problems, detail)
+
+
+def check_fault_after_reply(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    marker = "Bridge fault reply %s" % uuid.uuid4().hex[:12]
+    summary = "The note must be posted by the retry, not a second reply."
+    fields = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>%s</p>" % marker,
+    }
+    preview = post("preview", fields)
+    if preview["code"] != 200 or not preview["json"].get("ok"):
+        record("12 fault after postReply then note-only retry", False,
+               "preview failed %s" % preview["raw"][:400])
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    fields["note_summary"] = summary
+    problems = []
+    sent = None
+    try:
+        ctl(["set-fault", "after_reply"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or not sent["json"] or sent["json"].get("error") != "partial_note_missing":
+        problems.append("first send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:400]))
+    else:
+        response_id = sent["json"].get("response_entry_id")
+        ledger = ctl(["ledger", sent["rid"]])
+        if not ledger.get("found") or ledger.get("status") != "reply_recorded":
+            problems.append("ledger %s" % ledger)
+        if ledger.get("response_entry_id") != response_id:
+            problems.append("ledger response id %s, body %s" % (
+                ledger.get("response_entry_id"), response_id))
+        midway = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        replies = [entry for entry in midway if entry["type"] == "R"]
+        notes = [entry for entry in midway if entry["type"] == "N"]
+        if len(replies) != 1 or replies[0]["id"] != response_id:
+            problems.append("reply rows after the fault %s" % replies)
+        if notes:
+            problems.append("a note was posted during the fault")
+        retry = post("send", fields, rid=sent["rid"])
+        if retry["code"] != 200 or not retry["json"] or not retry["json"].get("ok"):
+            problems.append("retry %s %s" % (retry["code"], retry["raw"][:400]))
+        elif retry["json"].get("response_entry_id") != response_id:
+            problems.append("retry posted a different reply %s" % retry["json"])
+        final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        if len([entry for entry in final if entry["type"] == "R"]) != 1:
+            problems.append("R count after retry is not 1")
+        note_err = expect_note(final, staff, summary)
+        if note_err:
+            problems.append(note_err)
+        done = ctl(["ledger", sent["rid"]])
+        if done.get("status") != "completed" or not done.get("note_entry_id"):
+            problems.append("ledger after retry %s" % done)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("12 fault after postReply then note-only retry", not problems, detail)
+
+
+def check_fault_note(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    marker = "Bridge fault note %s" % uuid.uuid4().hex[:12]
+    summary = "The note failed once and the retry must add exactly one."
+    fields = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>%s</p>" % marker,
+    }
+    preview = post("preview", fields)
+    if preview["code"] != 200 or not preview["json"].get("ok"):
+        record("13 note failure then retry completes one note", False,
+               "preview failed %s" % preview["raw"][:400])
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    fields["note_summary"] = summary
+    problems = []
+    sent = None
+    try:
+        ctl(["set-fault", "note_fail"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or not sent["json"] or sent["json"].get("error") != "partial_note_missing":
+        problems.append("first send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:400]))
+    else:
+        if sent["json"].get("ok"):
+            problems.append("note failure was reported as success")
+        response_id = sent["json"].get("response_entry_id")
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "reply_recorded" or ledger.get("note_entry_id"):
+            problems.append("ledger %s" % ledger)
+        midway = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        if len([entry for entry in midway if entry["type"] == "R"]) != 1:
+            problems.append("expected one reply before the retry")
+        if any(entry["type"] == "N" for entry in midway):
+            problems.append("a note was posted despite note_fail")
+        retry = post("send", fields, rid=sent["rid"])
+        if retry["code"] != 200 or not retry["json"] or not retry["json"].get("ok"):
+            problems.append("retry %s %s" % (retry["code"], retry["raw"][:400]))
+        elif retry["json"].get("response_entry_id") != response_id:
+            problems.append("retry response id changed")
+        final = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        if len([entry for entry in final if entry["type"] == "R"]) != 1:
+            problems.append("R count after retry is not 1")
+        note_err = expect_note(final, staff, summary)
+        if note_err:
+            problems.append(note_err)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("13 note failure then retry completes one note", not problems, detail)
+
+
+def mail_for_marker(messages, marker, owner):
+    """Customer copies only. Staff activity alerts can quote the same reply."""
+    owner = (owner or "").lower()
+    hits = []
+    for message in messages:
+        full = mail_full(message["ID"])
+        blob = (full.get("HTML") or "") + "\n" + (full.get("Text") or "")
+        present = addrs(full.get("To")) + addrs(full.get("Cc"))
+        if marker in blob and owner in present:
+            hits.append(full)
+    return hits
+
+
+def check_recipients(staff, ticket):
+    original = ctl(["collabs", ticket["number"]])["collaborators"]
+    if not original:
+        record("14 preview recipients match the mail", False, "fixture has no collaborators")
+        return
+    chosen = original[0]
+    others = [row["email"] for row in original[1:] if row.get("email")]
+    problems = []
+    try:
+        ctl(["set-collab", ticket["number"], str(chosen["user_id"]), "0"])
+        marker = "Bridge inactive collab %s" % uuid.uuid4().hex[:12]
+        fields = {
+            "ticket_number": ticket["number"],
+            "staff_username": staff["username"],
+            "response_html": "<p>%s</p>" % marker,
+            "reply_to": "all",
+            "cc_user_ids": [chosen["user_id"]],
+        }
+        before_mail = mail_index()
+        preview = post("preview", fields)
+        if preview["code"] != 200 or not preview["json"].get("ok"):
+            problems.append("inactive preview %s" % preview["raw"][:400])
+        else:
+            cc = [bracket_addr(item) for item in preview["json"]["cc"]]
+            to = [bracket_addr(item) for item in preview["json"]["to"]]
+            if chosen["email"] not in cc:
+                problems.append("inactive collaborator %s missing from preview cc %s" % (
+                    chosen["email"], cc))
+            for email in others:
+                if email in cc or email in to:
+                    problems.append("unselected collaborator %s is in the preview" % email)
+            if ticket["owner_email"].lower() not in to:
+                problems.append("owner missing from preview to %s" % to)
+            fields["preview_hash"] = preview["json"]["preview_hash"]
+            fields["note_summary"] = "Reply including one collaborator who was inactive."
+            sent = post("send", fields)
+            if sent["code"] != 200 or not sent["json"].get("ok"):
+                problems.append("inactive send %s %s" % (sent["code"], sent["raw"][:400]))
+            else:
+                hits = mail_for_marker(new_messages(before_mail), marker, ticket["owner_email"])
+                if len(hits) != 1:
+                    problems.append("inactive mail hits %s" % len(hits))
+                else:
+                    got_to = sorted(addrs(hits[0].get("To")))
+                    got_cc = sorted(addrs(hits[0].get("Cc")))
+                    if got_to != sorted(to) or got_cc != sorted(cc):
+                        problems.append("inactive mail to %s cc %s, preview to %s cc %s" % (
+                            got_to, got_cc, sorted(to), sorted(cc)))
+
+        marker = "Bridge empty collab %s" % uuid.uuid4().hex[:12]
+        fields = {
+            "ticket_number": ticket["number"],
+            "staff_username": staff["username"],
+            "response_html": "<p>%s</p>" % marker,
+            "reply_to": "all",
+            "cc_user_ids": [],
+        }
+        before_mail = mail_index()
+        preview = post("preview", fields)
+        if preview["code"] != 200 or not preview["json"].get("ok"):
+            problems.append("empty preview %s" % preview["raw"][:400])
+        else:
+            cc = [bracket_addr(item) for item in preview["json"]["cc"]]
+            to = [bracket_addr(item) for item in preview["json"]["to"]]
+            if cc:
+                problems.append("explicit [] still previews cc %s" % cc)
+            if to != [ticket["owner_email"].lower()]:
+                problems.append("explicit [] to %s, owner %s" % (to, ticket["owner_email"]))
+            fields["preview_hash"] = preview["json"]["preview_hash"]
+            fields["note_summary"] = "Reply with every collaborator unchecked."
+            sent = post("send", fields)
+            if sent["code"] != 200 or not sent["json"].get("ok"):
+                problems.append("empty send %s %s" % (sent["code"], sent["raw"][:400]))
+            else:
+                hits = mail_for_marker(new_messages(before_mail), marker, ticket["owner_email"])
+                if len(hits) != 1:
+                    problems.append("empty mail hits %s" % len(hits))
+                else:
+                    got_to = sorted(addrs(hits[0].get("To")))
+                    got_cc = sorted(addrs(hits[0].get("Cc")))
+                    if got_to != sorted(to) or got_cc != sorted(cc):
+                        problems.append("empty mail to %s cc %s, preview to %s cc %s" % (
+                            got_to, got_cc, sorted(to), sorted(cc)))
+    finally:
+        for row in original:
+            ctl(["set-collab", ticket["number"], str(row["user_id"]),
+                 "1" if row["active"] else "0"])
+    detail = "ticket %s collaborator %s" % (ticket["number"], chosen["email"])
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("14 preview recipients match the mail", not problems, detail)
+
+
+def check_owner_stale(staff, ticket):
+    fields = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>Bridge owner change should not send</p>",
+    }
+    preview = post("preview", fields)
+    if preview["code"] != 200 or not preview["json"].get("ok"):
+        record("15 owner change after preview is stale", False,
+               "preview failed %s" % preview["raw"][:400])
+        return
+    other = ctl(["other-user", ticket["number"]])
+    changed = None
+    problems = []
+    try:
+        changed = ctl(["set-owner", ticket["number"], staff["username"], str(other["user_id"])])
+        if changed.get("owner_user_id") != other["user_id"]:
+            problems.append("owner did not change %s" % changed)
+        after = ctl(["state", ticket["number"]])
+        fields["preview_hash"] = preview["json"]["preview_hash"]
+        fields["note_summary"] = "This send must be refused."
+        sent = post("send", fields)
+        later = ctl(["state", ticket["number"]])
+        entries = ctl(["entries", ticket["number"], str(after["last_entry_id"])])["entries"]
+        replies = [entry for entry in entries if entry["type"] == "R"]
+        if not (sent["code"] == 409 and sent["json"] and sent["json"].get("error") == "stale_preview"):
+            problems.append("send %s %s" % (sent["code"], sent["raw"][:300]))
+        if replies or later["last_entry_id"] != after["last_entry_id"]:
+            problems.append("thread moved %s -> %s replies %s" % (
+                after["last_entry_id"], later["last_entry_id"], len(replies)))
+    finally:
+        if changed and changed.get("old_user_id"):
+            ctl(["set-owner", ticket["number"], staff["username"], str(changed["old_user_id"])])
+    detail = "ticket %s owner %s -> %s" % (
+        ticket["number"], ticket.get("owner_user_id"), other.get("user_id"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("15 owner change after preview is stale", not problems, detail)
+
+
+def check_no_access_options(staff, reply_staff, ticket):
+    banned = [ticket["number"], ticket.get("owner_email") or "", ticket.get("subject") or ""]
+    opts = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    problems = []
+    if not opts["json"] or opts["json"].get("error") != "no_access":
+        problems.append("options %s %s" % (opts["code"], opts["raw"][:300]))
+    else:
+        leaked = denial_is_empty(opts, banned)
+        if leaked:
+            problems.append("options " + leaked)
+    canned = post("canned", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "canned_id": "original",
+    })
+    if not canned["json"] or canned["json"].get("error") != "no_access":
+        problems.append("canned %s %s" % (canned["code"], canned["raw"][:200]))
+    else:
+        leaked = denial_is_empty(canned, banned)
+        if leaked:
+            problems.append("canned " + leaked)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>should not preview</p>",
+    })
+    if not preview["json"] or preview["json"].get("error") != "no_access":
+        problems.append("preview %s %s" % (preview["code"], preview["raw"][:200]))
+    else:
+        leaked = denial_is_empty(preview, banned)
+        if leaked:
+            problems.append("preview " + leaked)
+    missing = post("options", {
+        "ticket_number": "991991991",
+        "staff_username": reply_staff["username"],
+    })
+    if not missing["json"] or missing["json"].get("error") != "ticket_not_found":
+        problems.append("missing %s %s" % (missing["code"], missing["raw"][:200]))
+    else:
+        leaked = denial_is_empty(missing, ["991991991"])
+        if leaked:
+            problems.append("missing " + leaked)
+    detail = "options %s canned %s preview %s missing %s" % (
+        opts["code"], canned["code"], preview["code"], missing["code"])
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("16 no_access options leak nothing", not problems, detail)
+
+
+def check_oversize(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    rid = str(uuid.uuid4())
+    sent = {"code": 0, "raw": ""}
+    problems = []
+    try:
+        ctl(["set-max", "128"])
+        payload = {
+            "ticket_number": ticket["number"],
+            "staff_username": staff["username"],
+            "response_html": "<p>%s</p>" % ("X" * 400),
+            "note_summary": "This body is larger than the configured limit.",
+        }
+        sent = post("send", payload, rid=rid)
+        after = ctl(["state", ticket["number"]])
+        ledger = ctl(["ledger", rid])
+        if sent["code"] != 413:
+            problems.append("HTTP %s %s" % (sent["code"], sent["raw"][:300]))
+        if after["last_entry_id"] != before["last_entry_id"] or after["counts"] != before["counts"]:
+            problems.append("thread changed")
+        if ledger.get("found"):
+            problems.append("ledger row was written for a rejected body")
+        if ticket["number"] in (sent["raw"] or ""):
+            problems.append("413 body contains the ticket number")
+    finally:
+        ctl(["set-max", "8388608"])
+    detail = "ticket %s HTTP %s" % (ticket["number"], sent["code"])
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("17 oversized body is rejected", not problems, detail)
 
 
 if __name__ == "__main__":
