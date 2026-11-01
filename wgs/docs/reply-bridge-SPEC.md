@@ -208,3 +208,76 @@ file classes).
 8. `reply_to=none`: reply recorded, no customer email, note posted.
 9. Collaborators untouched when `cc_user_ids` is omitted.
 10. Preview then a new customer message arrives: send refused as `stale_preview`.
+
+---
+
+# v2 additions (David, 2026-11-01, after the first live reply)
+
+## V2-1. Verify every send
+After the reply and the internal note, the bridge re-reads osTicket (fresh
+objects / DB, not in-memory state) and returns
+`verification: {reply_recorded, reply_by_staff, reply_body_matches,
+note_recorded, note_text_exact, status_expected, status_actual,
+status_matches, all_passed}`. Any false item: `ok:false`, code
+`verification_failed`, with the block and the entry ids. Never resend.
+A replayed request id re-runs the verification against the stored ids.
+
+## V2-2. Default close (decided in the tools, exposed by the bridge)
+- New plugin config field `default_close_status` (choice of enabled
+  statuses whose state is `closed`; default = the status named `Closed`,
+  else the lowest-id closed status). Production: "Closed" (id 3), not
+  "Cold Sales Lead".
+- `options` adds `default_close_status {id,name}` and `can_close` (the acting
+  staff may close this ticket now: `ticket.close` role permission plus the
+  ticket's own closeability, e.g. open tasks / required fields).
+- The bridge keeps `reply_status_id` explicit (default = current status).
+  The MCP tools choose: close by default with `default_close_status` when
+  `can_close`; leave open only when the staff member said so (`leaveOpen`);
+  when the staff cannot close, keep the current status and warn.
+
+## V2-3. Standalone status change: `POST /api/wgs-reply/status`
+Input: `ticket_number`, `staff_username`, `status_id`, `summary` (required).
+As the acting staff, with the same checks the staff UI status change uses
+(access, `ticket.close` for closed states, reopen rules), call native
+`Ticket::setStatus()`. Then post an internal note via `postNote`
+(alert=false, no further status change):
+```
+Status set to <status name> using Claude by <staff full name>
+
+<summary>
+```
+Idempotent by `X-WGS-Request-Id` (same ledger). Verify like V2-1
+(status_matches, note_recorded, note_text_exact). Refuse a no-op
+(already in that status) with code `no_change`.
+
+## V2-4. Template awareness
+`options` and `preview` add `template`:
+`{adds_greeting, greeting_rendered, adds_staff_name, adds_signature,
+before_response_rendered, after_response_rendered}`, computed from the
+department's live `ticket.reply` template by splitting at `%{response}` and
+rendering each side with osTicket's own variable replacement (so it follows
+template edits). `preview.warnings` flags a response that starts with a
+greeting (Hi/Hello/Dear/Hey/<recipient first name>,) when the template adds
+one, or ends with the staff member's name / a sign-off when the template
+adds `%{poster}`, or includes a signature block when one is selected.
+
+## V2-5. Secret entry that browsers cannot spoil
+- The Shared secret input must carry `autocomplete="new-password"` (or the
+  osTicket-supported equivalent) and its hint must say browsers may autofill
+  a saved password there; clear it, paste, save.
+- Ship `wgs/plugins/wgs-reply-bridge/cli/set-secret.php` (refuses non-CLI),
+  the reviewed one-time script: reads the secret from STDIN, stores it through
+  the field's own `to_database`, re-reads through a fresh config, prints only
+  lengths and `readback_match`. Usage in the README and Help.
+
+## V2-6. Help inside osTicket
+Setup documentation available from the plugin's admin page: if osTicket
+1.17.6 lets a plugin add its own tab without changing core files, add a
+"Help" tab; otherwise a clearly titled Help section at the top of the Config
+tab (FreeText / section field). Content: what the bridge does, every config
+field, install on a new server, adding another instance (e.g. a second MCP
+host: its own instance, IP, secret), setting the secret (UI and CLI),
+the MCP side (.env keys, staff_identities.json, mux identities file +
+`MCP_MUX_ALLOW_ANONYMOUS`), personal keys per staff member, how to test,
+and troubleshooting (disabled, ip_not_allowed, auth_failed, stale_timestamp,
+verification_failed). No secrets in the help text. Never modify core files.
