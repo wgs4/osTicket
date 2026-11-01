@@ -109,6 +109,9 @@ try {
     case 'ledger':
         bridge_out(bridge_ledger($argv[2]));
         break;
+    case 'render-config':
+        bridge_out(bridge_render_config());
+        break;
     default:
         bridge_fail('Unknown command.', array('noise' => $noise));
     }
@@ -202,6 +205,7 @@ function bridge_install($cidr) {
                 'allowed_ips' => $cidr,
                 'enabled' => 1,
                 'max_body_bytes' => (string) ($inst->getConfig()->get('max_body_bytes') ?: '8388608'),
+                'default_close_status' => bridge_close_status_id($inst->getConfig()),
             );
             if (!$inst->update($vars, $errors))
                 bridge_fail('Could not update the plugin instance.', array('errors' => $errors));
@@ -342,7 +346,7 @@ function bridge_fixtures() {
         if (!$staff || !$staff->isActive() || !$staff->getSignature())
             continue;
         $buckets = bridge_bucket($open, $staff);
-        if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 1 && count($buckets['collab']) >= 1) {
+        if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 3 && count($buckets['collab']) >= 1) {
             $reply = $staff;
             break;
         }
@@ -352,7 +356,7 @@ function bridge_fixtures() {
             if (!$staff->getSignature())
                 continue;
             $buckets = bridge_bucket($open, $staff);
-            if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 1 && count($buckets['collab']) >= 1) {
+            if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 3 && count($buckets['collab']) >= 1) {
                 $reply = $staff;
                 break;
             }
@@ -426,10 +430,13 @@ function bridge_fixtures() {
         $threadVars = $candidate;
         break;
     }
+    $verify = $take($buckets['any']);
+    $verifyFault = $take($buckets['any']);
+    $statusChange = $take($buckets['close']);
     if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale
             || !$race || !$faultReply || !$faultNote || !$owner
             || !$beforeReply || !$twoNotes || !$bodyHash || !$due || !$planted
-            || !$threadVars)
+            || !$threadVars || !$verify || !$verifyFault || !$statusChange)
         bridge_fail('Not enough distinct tickets for the reply staff.', array(
             'any' => count($buckets['any']),
             'close' => count($buckets['close']),
@@ -472,6 +479,8 @@ function bridge_fixtures() {
                 continue;
             if ($ticket->checkStaffPerm($staff, Ticket::PERM_REPLY))
                 continue;
+            if ($ticket->checkStaffPerm($staff, Ticket::PERM_CLOSE))
+                continue;
             if ($ticket->isChild() && $ticket->getMergeType() != 'visual')
                 continue;
             $noReplyStaff = $staff;
@@ -506,6 +515,9 @@ function bridge_fixtures() {
             'due_date' => bridge_brief($due),
             'planted' => bridge_brief($planted),
             'thread_vars' => bridge_brief($threadVars),
+            'verify' => bridge_brief($verify),
+            'verify_fault' => bridge_brief($verifyFault),
+            'status_change' => bridge_brief($statusChange),
             'no_access' => bridge_brief($noAccessTicket),
             'no_reply' => bridge_brief($noReplyTicket),
         ),
@@ -664,6 +676,65 @@ function bridge_instance() {
 }
 
 /**
+ * ChoiceField stores the status id. Post that id back so a later save
+ * does not blank the field. The name is not required here.
+ */
+function bridge_close_status_id($cfg) {
+    $stored = $cfg ? $cfg->get('default_close_status') : null;
+    if (is_array($stored)) {
+        reset($stored);
+        $stored = key($stored);
+    }
+    if ($stored === null || $stored === '')
+        return '';
+    return (string) (int) $stored;
+}
+
+/**
+ * Render the instance Config form the way the admin page does.
+ * Returns flags only. If the shared secret appears in the HTML, this
+ * refuses and does not return the HTML.
+ */
+function bridge_render_config() {
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $inst = bridge_instance();
+    $cfg = $inst->getConfig();
+    $secret = (string) $cfg->get('shared_secret');
+    $form = $inst->getForm();
+    if (!$form)
+        bridge_fail('Config form did not load.');
+    $options = array();
+    ob_start();
+    include INCLUDE_DIR . 'staff/templates/simple-form.tmpl.php';
+    $html = ob_get_clean();
+    if ($secret !== '' && strpos($html, $secret) !== false)
+        bridge_fail('The rendered config page contains the shared secret. Refusing to return it.');
+    $needles = array(
+        'WGS Reply Bridge help',
+        'autocomplete="new-password"',
+        'Browsers may autofill',
+        'ip_not_allowed',
+        'auth_failed',
+        'stale_timestamp',
+        'verification_failed',
+        'MCP_MUX_ALLOW_ANONYMOUS',
+        'staff_identities.json',
+        'set-secret.php',
+    );
+    $found = array();
+    foreach ($needles as $needle)
+        $found[$needle] = (strpos($html, $needle) !== false);
+    $found['disabled'] = (strpos($html, 'disabled.') !== false);
+    $found['Help heading'] = (strpos($html, 'Help</h3>') !== false);
+    return array(
+        'ok' => true,
+        'html_length' => strlen($html),
+        'secret_in_html' => false,
+        'found' => $found,
+    );
+}
+
+/**
  * Rewrite one non-secret setting. The decrypted secret is posted back so
  * the password field does not wipe it. The secret is not part of the output.
  */
@@ -679,6 +750,7 @@ function bridge_config($changes) {
         'allowed_ips' => (string) $cfg->get('allowed_ips'),
         'enabled' => $cfg->get('enabled') ? 1 : 0,
         'max_body_bytes' => (string) ($cfg->get('max_body_bytes') ?: '8388608'),
+        'default_close_status' => bridge_close_status_id($cfg),
     );
     foreach ($changes as $key => $value) {
         if (!array_key_exists($key, $vars) || $key === 'shared_secret')
@@ -791,8 +863,9 @@ function bridge_ledger($requestId) {
 function bridge_fault_constant($flag) {
     if ($flag === 'off')
         $flag = '';
-    if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail' && $flag !== 'before_reply')
-        bridge_fail('Fault must be after_reply, note_fail, before_reply, or off.');
+    if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail'
+            && $flag !== 'before_reply' && $flag !== 'verify_status')
+        bridge_fail('Fault must be after_reply, note_fail, before_reply, verify_status, or off.');
 
     $path = '/var/www/html/include/ost-config.php';
     $raw = file_get_contents($path);

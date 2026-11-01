@@ -15,13 +15,35 @@ plugin at `include/plugins/wgs-reply-bridge/`.
 2. Admin Panel > Manage > Plugins. Install **WGS Reply Bridge**, then enable it.
 3. Add the instance and set:
    - **Shared secret.** HMAC key for the caller. A password field, so osTicket
-     encrypts it. Use at least 8 characters with upper, lower, and a digit or
-     symbol (the password-policy plugin applies).
+     encrypts it. The box uses `autocomplete="new-password"`. Browsers may
+     autofill a saved password there. Clear it, paste the secret, and save.
+     Use at least 8 characters with upper, lower, and a digit or symbol (the
+     password-policy plugin applies). From the osTicket host, the same write
+     can be done without a browser:
+
+     ```
+     printf '%s' "$SECRET" | php include/plugins/wgs-reply-bridge/cli/set-secret.php INSTANCE_ID
+     ```
+
+     The script reads stdin, stores the value through the field's own
+     `to_database`, reads it back through a fresh config, and prints only
+     lengths and `readback_match`. It never prints the secret. It refuses
+     every SAPI other than `cli`.
    - **Allowed IPs.** Comma-separated IPs or CIDR blocks. Default
      `192.168.1.193`, which is the osticket-mcp host. Checked with
      `osTicket::get_client_ip()`.
    - **Enabled.** Turns the routes off without disabling the plugin.
    - **Max body bytes.** Default `8388608`.
+   - **Default close status.** An enabled status whose state is closed. The
+     default is the status named Closed, or the lowest-id closed status when
+     that name is missing. The reply route does not apply it.
+     `reply_status_id` stays explicit and defaults to the current status.
+
+   A second MCP host is a second instance, with its own allowed IP and its
+   own secret. The Help section at the top of the Config tab describes
+   install, a second instance, the CLI, and the MCP files. osTicket 1.17
+   hardcodes the Instance and Config tabs, so the plugin cannot add a Help
+   tab without a core edit. The section is a FreeText field instead.
 4. The first request creates `<prefix>wgs_reply_ledger` if it is missing.
    An existing table gains `baseline_entry_id`, `executing_at`, and
    `native_returned` when those columns are absent, and `status` is widened
@@ -60,10 +82,11 @@ A browser session or cookie is never accepted. CSRF is not disabled.
 
 | Route | Body | Result |
 | --- | --- | --- |
-| `/api/wgs-reply/options` | `ticket_number`, `staff_username` | What the Post Reply form would show that agent right now |
+| `/api/wgs-reply/options` | `ticket_number`, `staff_username` | What the Post Reply form would show that agent right now, plus `default_close_status`, `can_close`, and `template` |
 | `/api/wgs-reply/canned` | those, plus `canned_id` (`original`, `lastmessage`, or a numeric id) | The expanded body and attachment names |
-| `/api/wgs-reply/preview` | the reply fields | Recipients, From, signature, status after, rendered `ticket.reply` subject and body, and `preview_hash`. Writes nothing |
-| `/api/wgs-reply/send` | the reply fields, `preview_hash`, and `note_summary` | Posts the reply, then the internal note |
+| `/api/wgs-reply/preview` | the reply fields | Recipients, From, signature, status after, rendered `ticket.reply` subject and body, `template`, `warnings`, and `preview_hash`. Writes nothing |
+| `/api/wgs-reply/send` | the reply fields, `preview_hash`, and `note_summary` | Posts the reply, then the internal note, then returns `verification` |
+| `/api/wgs-reply/status` | `ticket_number`, `staff_username`, `status_id`, `summary` | `Ticket::setStatus`, then one internal note. Does not require `ticket.reply` |
 
 Reply fields: `response_html` (required), `signature` (`none`, `mine`, `dept`;
 default is the agent's default when that choice exists), `reply_to` (`all`,
@@ -111,10 +134,13 @@ does not change either, and preview still renders them.
 
 Send order:
 
-1. A request id that already has a stored result returns those bytes and
-   does not read the ticket. `completed` is HTTP 200. `reply_state_unknown`
-   and `reply_recorded_mail_unknown` are HTTP 500. The same request id never
-   posts again.
+1. A request id that already has a stored result does not post again.
+   `completed` and `verification_failed` re-read the stored entry ids and
+   compare them to the stored hashes. When that block is unchanged, the
+   original HTTP bytes are returned and the new body is not interpreted.
+   When it differs, a new body is returned and nothing is sent again.
+   `reply_state_unknown` and `reply_recorded_mail_unknown` are HTTP 500 and
+   return the stored bytes without that re-read. `completed` is HTTP 200.
 2. Reject `no_access` and a missing ticket before any ticket payload.
 3. Take a MySQL advisory lock named `wgs_reply_<ticket_id>` (wait 10 seconds,
    refuse `busy` otherwise). Reload the ticket. Check the stored result again.
@@ -133,8 +159,12 @@ Send order:
    own update as soon as osTicket saves the row, and the listener is removed
    when the call returns. `native_returned` is set only after `postReply`
    returns that same entry.
-8. Post the internal note and mark the row `completed`. The acting agent's
-   response draft is deleted when the response id is saved.
+8. Post the internal note. Re-read the reply, the note, and the status from
+   the database (not the in-memory ticket). When every check passes, mark
+   the row `completed` and return `verification`. When any check fails, the
+   row is `verification_failed` (HTTP 500) with the entry ids and the block.
+   Nothing is sent again. The acting agent's response draft is deleted when
+   the response id is saved.
 
 A `postReply` that saved a row and then threw, or that returned a different
 entry than the one captured, is `reply_recorded_mail_unknown`. The audit note
@@ -178,9 +208,50 @@ names that cannot be projected. Codes include `auth_failed`, `ip_not_allowed`,
 `no_reply_permission`, `ticket_not_found`, `locked_by_other`, `busy`,
 `stale_preview`, `preview_unsupported`, `invalid_option`, `banned_owner`,
 `empty_response`, `empty_summary`, `already_done`, `partial_note_missing`,
-`reply_state_unknown`, and `mail_handoff_unknown`. `no_access` and
+`reply_state_unknown`, `mail_handoff_unknown`, `verification_failed`,
+`no_change`, and `no_close_permission`. `no_access` and
 `ticket_not_found` are returned before any ticket payload is built. That
 body is only `ok`, `error`, and `message`.
+
+`verification` is `{reply_recorded, reply_by_staff, reply_body_matches,
+note_recorded, note_text_exact, status_expected, status_actual,
+status_matches, all_passed}`. The reply and note checks compare a fresh SQL
+read to the sha256 of the column osTicket stored. The ledger keeps those
+hashes, not the message text. On a status change the reply checks are true
+because that call did not post a reply. `all_passed` then means the status
+and the note matched.
+
+`options.default_close_status` is `{id, name}`. `options.can_close` is true
+when the acting agent's role has `ticket.close` and `Ticket::isCloseable()`
+is true. The tools decide whether to close. The bridge does not close a
+reply unless `reply_status_id` says so.
+
+`template` is computed from the department's live `ticket.reply` body,
+split at the first `%{response}`, with each side rendered by
+`Ticket::replaceVars`. `preview.warnings` is a list. It flags a response
+that starts with Hi, Hello, Dear, Hey, or the recipient's first name when
+the template already adds a greeting, a response that ends with the staff
+name or a sign-off when the template adds `%{poster}` or `%{staff}`, and a
+response that already contains the selected signature text. Warnings do not
+change the preview hash.
+
+`POST /api/wgs-reply/status` uses the same permission checks as the staff
+status dialog. A closed target needs `ticket.close` and a closeable ticket.
+An open target needs `ticket.close` or `ticket.create`. A ticket that is
+already in that status is `no_change` (HTTP 409) and does not consume the
+request id. `Ticket::setStatus` is called with an empty comment so osTicket
+does not post its own note. The bridge note is:
+
+```
+Status set to <status name> using Claude by <staff full name>
+
+<summary>
+```
+
+`summary` is required. The note is posted with alerts off and does not
+change status again. The same request id is idempotent. A second instance
+is its own IP list and its own secret. A request is accepted by the first
+enabled instance whose IP matches and whose secret matches the signature.
 
 The ledger is a state machine. A row is never deleted once execution starts.
 
@@ -197,7 +268,12 @@ The ledger is a state machine. A row is never deleted once execution starts.
   the reply is there, add the missing note by hand. This request will not
   be sent again, and a later thread entry is not attached to it.
 - `completed`: the note id and the success JSON. `mail` is
-  `handed_to_osticket` only on this path.
+  `handed_to_osticket` only on a completed reply. A completed status change
+  has no `mail` field.
+- `verification_failed`: the reply or the status was saved, and a fresh read
+  did not match. HTTP 500. This request is not sent again.
+- `status_reserved` and `status_executing`: the status route's own states.
+  A send does not resume them into `postReply`.
 
 `partial_note_missing` means the reply is saved and the note is not. It is
 never reported as success. The same request id posts the note and then
@@ -207,8 +283,11 @@ The constant `WGS_REPLY_BRIDGE_TEST_FAULTS` is a staging switch. Production
 does not define it, and the installer never defines it. The only honored
 values are `after_reply` (thrown from the response listener after the row is
 saved), `before_reply` (thrown after the row is `executing` and before
-`postReply`), and `note_fail` (the note is not posted). Anything else is
-ignored. A `test_fault` row in plugin config does nothing.
+`postReply`), `note_fail` (the note is not posted), and `verify_status`
+(the fresh status read is forced to a different enabled status, then the
+original status id is written back). Anything else is ignored. A
+`test_fault` row in plugin config does nothing. `verify_status` does not
+run on a replay.
 
 ## Known limits
 
@@ -240,8 +319,10 @@ ignored. A `test_fault` row in plugin config does nothing.
   turned into attachments by osTicket when the reply is posted, not during
   preview.
 - The ledger stores the request id, the state, the entry ids,
-  `native_returned`, and the response JSON. It does not store the secret,
-  the signature, or the message body. A crash after the response row is
+  `native_returned`, and the response JSON. A completed or
+  `verification_failed` row also stores the sha256 of the expected reply
+  column and the expected note column, plus the expected status id. It does
+  not store the secret, the signature, or the message body. A crash after the response row is
   saved leaves `reply_recorded_mail_unknown` (or `reply_recorded` when
   `postReply` had already returned). The same request id finishes the note
   when it is missing and does not post a second reply. A crash before the

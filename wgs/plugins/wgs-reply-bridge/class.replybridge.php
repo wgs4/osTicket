@@ -24,19 +24,24 @@ class WgsReplyBridgePlugin extends Plugin {
     // this is cleared before the listener is removed.
     var $capture = null;
     var $captureConnected = false;
+    // bootstrap() runs once per instance. Routes are registered once.
+    var $routesReady = false;
+    // The reply this request intends to verify. Not kept in the HTTP body.
+    var $pendingClean = null;
+    var $pendingStatusId = 0;
+    var $pendingSummary = '';
 
     const PREVIEW_TTL = 900;
     const TIMESTAMP_SKEW = 300;
     const ADVISORY_WAIT = 10;
 
-    function isMultiInstance() {
-        return false;
-    }
-
     function bootstrap() {
         $config = $this->getConfig();
         if ($config)
             $this->instance = $config->getInstance();
+        if ($this->routesReady)
+            return;
+        $this->routesReady = true;
         $this->ensureLedger();
         Signal::connect('api', array($this, 'registerRoutes'));
     }
@@ -46,6 +51,7 @@ class WgsReplyBridgePlugin extends Plugin {
         $dispatcher->append(url_post('^/wgs-reply/canned$', array($this, 'canned')));
         $dispatcher->append(url_post('^/wgs-reply/preview$', array($this, 'preview')));
         $dispatcher->append(url_post('^/wgs-reply/send$', array($this, 'send')));
+        $dispatcher->append(url_post('^/wgs-reply/status$', array($this, 'status')));
     }
 
     function config() {
@@ -126,19 +132,22 @@ class WgsReplyBridgePlugin extends Plugin {
         $in = $this->gate('send');
         $requestId = $this->requestId();
 
-        // A finished id returns the stored bytes and does not touch the
-        // ticket. That is a completed reply, or a terminal failure that
-        // must not be sent again.
+        // A finished id re-checks the stored entry ids and does not post
+        // again. When that check still matches, the stored bytes are
+        // returned unchanged. The new body is not interpreted.
         if ($stored = $this->ledgerFetch($requestId)) {
             $done = $this->storedResult($stored);
-            if ($done)
-                $this->respond($done[0], $done[1]);
+            if ($done) {
+                list($http, $body) = $this->replayVerify($stored, $done);
+                $this->respond($http, $body);
+            }
         }
 
         $summary = isset($in['note_summary']) ? (string) $in['note_summary'] : '';
         $ctx = $this->context($in, true);
         $ticket = $ctx['ticket'];
         $staff = $ctx['staff'];
+        $this->rememberReply($in, $ticket, $summary);
 
         $this->advisoryAcquire($ticket->getId());
         try {
@@ -148,8 +157,10 @@ class WgsReplyBridgePlugin extends Plugin {
                 $this->fail('already_done', 'This request id was used on another ticket.', 409);
 
             $done = $this->storedResult($row);
-            if ($done)
-                $this->respond($done[0], $done[1]);
+            if ($done) {
+                list($http, $body) = $this->replayVerify($row, $done);
+                $this->respond($http, $body);
+            }
 
             // Resume before the hash check. A saved reply's own new entry,
             // or another send that landed after it, must not look stale.
@@ -184,23 +195,233 @@ class WgsReplyBridgePlugin extends Plugin {
         }
     }
 
+    /**
+     * Standalone status change. Same permission checks as
+     * ajax.tickets.php setTicketStatus, then Ticket::setStatus with an
+     * empty comment so osTicket does not post its own status note.
+     * The bridge note is the only note, and it does not change status.
+     */
+    function status() {
+        global $thisstaff;
+
+        $in = $this->gate('status');
+        $requestId = $this->requestId();
+        if ($stored = $this->ledgerFetch($requestId)) {
+            $done = $this->storedResult($stored);
+            if ($done) {
+                list($http, $body) = $this->replayVerify($stored, $done);
+                $this->respond($http, $body);
+            }
+        }
+
+        $summary = isset($in['summary']) ? trim((string) $in['summary']) : '';
+        if ($summary === '')
+            $this->fail('empty_summary', 'summary is required.', 400);
+
+        $username = isset($in['staff_username']) ? (string) $in['staff_username'] : '';
+        $number = isset($in['ticket_number']) ? (string) $in['ticket_number'] : '';
+        if ($username === '' || $number === '')
+            $this->fail('invalid_option', 'ticket_number and staff_username are required.', 400);
+        if (!isset($in['status_id']) || $in['status_id'] === '' || $in['status_id'] === null)
+            $this->fail('invalid_option', 'status_id is required.', 400);
+
+        $staff = Staff::lookup($username);
+        if (!$staff)
+            $this->fail('staff_not_found', 'Staff member was not found.', 404);
+        if (!$staff->isActive())
+            $this->fail('staff_inactive', 'Staff member is not active.', 403);
+        $thisstaff = $staff;
+
+        $ticket = Ticket::lookupByNumber($number);
+        if (!$ticket || !$ticket->getId())
+            $this->fail('ticket_not_found', 'Ticket was not found.', 404);
+        if (!$ticket->checkStaffPerm($staff))
+            $this->fail('no_access', 'Staff member cannot access this ticket.', 403);
+
+        $status = TicketStatus::lookup((int) $in['status_id']);
+        if (!$status || !$status->isEnabled())
+            $this->fail('invalid_option', 'That status is not an enabled status.', 400);
+        $state = strtolower((string) $status->getState());
+        if ($state !== 'open' && $state !== 'closed')
+            $this->fail('invalid_option', 'That status cannot be set from the bridge.', 400);
+
+        $this->advisoryAcquire($ticket->getId());
+        try {
+            $this->reloadTicket($ticket);
+            $row = $this->ledgerFetch($requestId);
+            if ($row && (int) $row['ticket_id'] !== (int) $ticket->getId())
+                $this->fail('already_done', 'This request id was used on another ticket.', 409);
+            $done = $this->storedResult($row);
+            if ($done) {
+                list($http, $body) = $this->replayVerify($row, $done);
+                $this->respond($http, $body);
+            }
+            if ($row && $row['status'] !== 'status_reserved' && $row['status'] !== 'status_executing')
+                $this->fail('already_done', 'This request id cannot be posted again.', 409);
+
+            if ((int) $ticket->getStatusId() === (int) $status->getId()
+                    && (!$row || $row['status'] === 'status_reserved'))
+                $this->fail('no_change', 'The ticket is already in that status.', 409);
+
+            $this->assertStatusPermission($ticket, $staff, $status);
+
+            if (!$row)
+                $this->ledgerInsert($requestId, $ticket->getId(), $staff->getId(), 'status_reserved');
+            $this->dropOwnerDirty($ticket);
+            $this->nativeLock($ticket, $staff);
+            $this->finishStatus($ticket, $staff, $status, $summary, $requestId);
+        } catch (WgsReplyBridgeFault $ex) {
+            $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
+        } catch (Throwable $ex) {
+            $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
+        }
+    }
+
+    /**
+     * ajax.tickets.php setTicketStatus permission switch, plus the
+     * closeability check setStatus itself applies.
+     */
+    function assertStatusPermission($ticket, $staff, $status) {
+        $role = $ticket->getRole($staff);
+        if (!$role)
+            $this->fail('no_access', 'Staff member cannot access this ticket.', 403);
+        $state = strtolower((string) $status->getState());
+        if ($state === 'closed') {
+            if (!$role->hasPerm(Ticket::PERM_CLOSE))
+                $this->fail('no_close_permission', 'Staff member cannot close this ticket.', 403);
+            $closeable = $ticket->isCloseable();
+            if ($closeable !== true)
+                $this->fail('invalid_option', is_string($closeable) ? $closeable : 'This ticket cannot be closed.', 409);
+        } elseif ($state === 'open') {
+            if (!$role->hasPerm(Ticket::PERM_CLOSE) && !$role->hasPerm(Ticket::PERM_CREATE))
+                $this->fail('no_close_permission', 'Staff member cannot reopen this ticket.', 403);
+        }
+    }
+
+    function finishStatus($ticket, $staff, $status, $summary, $requestId) {
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || ($row['status'] !== 'status_reserved' && $row['status'] !== 'status_executing'))
+            $this->fail('already_done', 'This request id cannot be posted again.', 409);
+        if ($row['status'] === 'status_reserved') {
+            $this->ledgerMarkExecutingAs($requestId, $this->lastEntryId($ticket), 'status_reserved', 'status_executing');
+            $row = $this->ledgerFetch($requestId);
+        }
+
+        $this->reloadTicket($ticket);
+        $this->dropOwnerDirty($ticket);
+        if ((int) $ticket->getStatusId() !== (int) $status->getId()) {
+            $errors = array();
+            // Empty comments: setStatus posts an alerted note when comments
+            // are set. The bridge note below is the only one.
+            if (!$ticket->setStatus($status, '', $errors)) {
+                $message = 'Unable to change the ticket status.';
+                if (!empty($errors['err']))
+                    $message = (string) $errors['err'];
+                $this->fail('invalid_option', $message, 409);
+            }
+        }
+
+        $noteText = $this->statusNoteText($staff, $status, $summary);
+        $noteId = ($row && $row['note_entry_id']) ? (int) $row['note_entry_id'] : 0;
+        if (!$noteId) {
+            $note = $this->postStatusNote($ticket, $staff, $noteText);
+            $row = $this->ledgerFetch($requestId);
+            if ($row && $row['note_entry_id'])
+                $noteId = (int) $row['note_entry_id'];
+            elseif ($note && $note->getId())
+                $noteId = (int) $note->getId();
+        }
+        if (!$noteId)
+            $this->fail('partial_note_missing', 'The status was saved but the internal note was not.', 500);
+
+        $expect = array(
+            'reply_sha256' => '',
+            'note_sha256' => $this->columnHash($this->expectedNoteColumn($noteText)),
+            'status_id' => (int) $status->getId(),
+            'require_reply' => false,
+        );
+        $verification = $this->readVerification((int) $ticket->getId(), (int) $staff->getId(), 0, $noteId, $expect, false);
+        $this->reloadTicket($ticket);
+        $statusNow = $ticket->getStatus();
+        $payload = array(
+            'ok' => true,
+            'response_entry_id' => null,
+            'note_entry_id' => (int) $noteId,
+            'status' => array(
+                'id' => (int) $ticket->getStatusId(),
+                'name' => $statusNow ? (string) $statusNow->getName() : '',
+                'state' => (string) $ticket->getState(),
+            ),
+            'verification' => $verification,
+        );
+        if (empty($verification['all_passed'])) {
+            $body = array(
+                'ok' => false,
+                'error' => 'verification_failed',
+                'message' => 'The status was saved, but a fresh read did not match. Nothing was sent again.',
+                'response_entry_id' => null,
+                'note_entry_id' => (int) $noteId,
+                'verification' => $verification,
+            );
+            $json = $this->encode($body);
+            $this->ledgerStoreResult($requestId, 'verification_failed', null, $noteId, $this->packResult($json, $expect), 'status_executing');
+            $this->respond(500, $json);
+        }
+        $json = $this->encode($payload);
+        $this->ledgerStoreResult($requestId, 'completed', null, $noteId, $this->packResult($json, $expect), 'status_executing');
+        $saved = $this->ledgerFetch($requestId);
+        if (!$saved || $saved['status'] !== 'completed')
+            $this->fail('invalid_option', 'Unable to record the status change.', 500);
+        $this->respond(200, $json);
+    }
+
+    function statusNoteText($staff, $status, $summary) {
+        return 'Status set to ' . (string) $status->getName() . ' using Claude by '
+            . (string) $staff->getName() . "\n\n" . $summary;
+    }
+
+    function postStatusNote($ticket, $staff, $text) {
+        $errors = array();
+        $this->connectCapture($ticket->getThreadId(), 'N');
+        try {
+            $note = $ticket->postNote(array(
+                'note' => new TextThreadEntryBody($text),
+            ), $errors, $staff, false);
+        } finally {
+            $this->disconnectCapture();
+        }
+        if ($note && $note->getId())
+            $this->ledgerCaptureNote($this->requestId(), (int) $note->getId());
+        return $note;
+    }
+
     // ---- authentication ---------------------------------------------------
 
     function gate($action) {
-        $cfg = $this->config();
-        if (!$cfg || !$cfg->get('enabled'))
+        $configs = $this->enabledConfigs();
+        if (!$configs)
             $this->fail('auth_failed', 'Reply bridge is disabled.', 403);
 
         // IP before the body. A rejected host must not be able to make us
-        // buffer a large request.
+        // buffer a large request. A second instance is its own IP list.
         $ip = osTicket::get_client_ip();
-        $allowed = preg_split('/\s*,\s*/', (string) $cfg->get('allowed_ips'), -1, PREG_SPLIT_NO_EMPTY);
-        if (!$ip || !Validator::check_ip($ip, $allowed))
+        $ipOk = array();
+        foreach ($configs as $cfg) {
+            $allowed = preg_split('/\s*,\s*/', (string) $cfg->get('allowed_ips'), -1, PREG_SPLIT_NO_EMPTY);
+            if ($ip && Validator::check_ip($ip, $allowed))
+                $ipOk[] = $cfg;
+        }
+        if (!$ipOk)
             $this->fail('ip_not_allowed', 'Source address is not allowed.', 403);
 
-        $max = (int) $cfg->get('max_body_bytes');
-        if ($max < 1)
-            $max = 8388608;
+        $max = 0;
+        foreach ($ipOk as $cfg) {
+            $n = (int) $cfg->get('max_body_bytes');
+            if ($n < 1)
+                $n = 8388608;
+            if ($n > $max)
+                $max = $n;
+        }
         $declared = isset($_SERVER['CONTENT_LENGTH']) ? (int) $_SERVER['CONTENT_LENGTH'] : 0;
         if ($declared > $max)
             $this->fail('invalid_option', 'Request body is too large.', 413);
@@ -215,9 +436,7 @@ class WgsReplyBridgePlugin extends Plugin {
             $this->fail('auth_failed', 'Authentication failed.', 401);
         if (abs(time() - (int) $stamp) > self::TIMESTAMP_SKEW)
             $this->fail('stale_timestamp', 'Timestamp is outside the allowed window.', 401);
-
-        $secret = (string) $cfg->get('shared_secret');
-        if ($secret === '' || !is_string($sig) || !preg_match('/^[a-f0-9]{64}$/i', $sig))
+        if (!is_string($sig) || !preg_match('/^[a-f0-9]{64}$/i', $sig))
             $this->fail('auth_failed', 'Authentication failed.', 401);
 
         // Public route path, not PATH_INFO. The rewrite to api/http.php
@@ -225,14 +444,55 @@ class WgsReplyBridgePlugin extends Plugin {
         $method = isset($_SERVER['REQUEST_METHOD']) ? strtoupper($_SERVER['REQUEST_METHOD']) : '';
         $path = '/api/wgs-reply/' . $action;
         $material = $stamp . "\n" . $rid . "\n" . $method . "\n" . $path . "\n" . hash('sha256', $raw);
-        $expect = hash_hmac('sha256', $material, $secret);
-        if (!hash_equals($expect, strtolower($sig)))
+        $matched = null;
+        foreach ($ipOk as $cfg) {
+            $secret = (string) $cfg->get('shared_secret');
+            if ($secret === '')
+                continue;
+            $expect = hash_hmac('sha256', $material, $secret);
+            if (hash_equals($expect, strtolower($sig))) {
+                $matched = $cfg;
+                break;
+            }
+        }
+        if (!$matched)
             $this->fail('auth_failed', 'Authentication failed.', 401);
+        $this->instance = $matched->getInstance();
+
+        $ownMax = (int) $matched->get('max_body_bytes');
+        if ($ownMax < 1)
+            $ownMax = 8388608;
+        if (strlen($raw) > $ownMax)
+            $this->fail('invalid_option', 'Request body is too large.', 413);
 
         $data = json_decode($raw, true);
         if (!is_array($data))
             $this->fail('invalid_option', 'Body must be a JSON object.', 400);
         return $data;
+    }
+
+    /**
+     * Enabled plugin instances whose own Enabled flag is on.
+     * One host is one instance. A second MCP host is a second instance.
+     */
+    function enabledConfigs() {
+        $out = array();
+        $instances = $this->getInstances();
+        if ($instances) {
+            foreach ($instances as $inst) {
+                if (!$inst->isEnabled())
+                    continue;
+                $cfg = $inst->getConfig();
+                if ($cfg && $cfg->get('enabled'))
+                    $out[] = $cfg;
+            }
+        }
+        if (!$out) {
+            $cfg = $this->config();
+            if ($cfg && $cfg->get('enabled'))
+                $out[] = $cfg;
+        }
+        return $out;
     }
 
     function requestId() {
@@ -269,7 +529,8 @@ class WgsReplyBridgePlugin extends Plugin {
         if (!defined('WGS_REPLY_BRIDGE_TEST_FAULTS'))
             return '';
         $flag = (string) WGS_REPLY_BRIDGE_TEST_FAULTS;
-        if ($flag === 'after_reply' || $flag === 'note_fail' || $flag === 'before_reply')
+        if ($flag === 'after_reply' || $flag === 'note_fail' || $flag === 'before_reply'
+                || $flag === 'verify_status')
             return $flag;
         return '';
     }
@@ -370,6 +631,9 @@ class WgsReplyBridgePlugin extends Plugin {
             'canned_responses' => array(),
             'attachments' => $this->attachmentLimits(),
             'auto_claim' => $this->wouldAutoClaim($ticket, $ticket->getStatus()),
+            'default_close_status' => $this->defaultCloseStatus(),
+            'can_close' => $this->canClose($ticket, $staff),
+            'template' => $this->templateInfo($ticket, $staff, $this->defaultSignatureText($ticket, $staff)),
         );
         if ($block)
             $out['reason'] = $block['error'];
@@ -809,6 +1073,7 @@ class WgsReplyBridgePlugin extends Plugin {
 
     function buildPreview($ticket, $staff, array $resolved) {
         $facts = $this->replyFacts($ticket, $staff, $resolved);
+        $template = $this->templateInfo($ticket, $staff, $facts['signature']);
         return array(
             'to' => $facts['to'],
             'cc' => $facts['cc'],
@@ -825,6 +1090,8 @@ class WgsReplyBridgePlugin extends Plugin {
             'auto_claim' => $facts['auto_claim'],
             'subject' => $facts['subject'],
             'body' => $facts['body'],
+            'template' => $template,
+            'warnings' => $this->previewWarnings($ticket, $staff, $resolved, $template),
             'preview_hash' => $this->makePreviewHash($ticket, $staff, $resolved, $facts),
         );
     }
@@ -1362,6 +1629,379 @@ class WgsReplyBridgePlugin extends Plugin {
         );
     }
 
+    // ---- v2: close, template, verification --------------------------------
+
+    /**
+     * The reply this request will verify. Set before the lock so a resume
+     * (a new HTTP request) still has the clean body and the status. Check 6
+     * returns from the stored result before this runs, so its empty body is
+     * never cleaned.
+     */
+    function rememberReply(array $in, $ticket, $summary) {
+        $this->pendingSummary = (string) $summary;
+        $this->pendingClean = null;
+        if (isset($in['response_html']) && is_string($in['response_html'])
+                && trim($in['response_html']) !== '') {
+            $clean = ThreadEntryBody::clean($in['response_html']);
+            if ($clean)
+                $this->pendingClean = $clean;
+        }
+        $statusId = (int) $ticket->getStatusId();
+        if (array_key_exists('reply_status_id', $in)
+                && $in['reply_status_id'] !== null && $in['reply_status_id'] !== '')
+            $statusId = (int) $in['reply_status_id'];
+        $this->pendingStatusId = $statusId;
+    }
+
+    /**
+     * Enabled closed status the tools should use. The stored id wins when
+     * it is still in that list. Otherwise the status named Closed, then
+     * the lowest id. The reply route does not apply this.
+     */
+    function defaultCloseStatus() {
+        $choices = WgsReplyBridgeConfig::closedStatusChoices();
+        $stored = $this->config() ? $this->config()->get('default_close_status') : null;
+        if (is_array($stored)) {
+            reset($stored);
+            $stored = key($stored);
+        }
+        $storedId = ($stored === null || $stored === '') ? 0 : (int) $stored;
+        if ($storedId && isset($choices[$storedId]))
+            return array('id' => $storedId, 'name' => (string) $choices[$storedId]);
+        foreach ($choices as $id => $name) {
+            if (strcasecmp($name, 'Closed') === 0)
+                return array('id' => (int) $id, 'name' => (string) $name);
+        }
+        if ($choices) {
+            $ids = array_keys($choices);
+            sort($ids, SORT_NUMERIC);
+            $id = (int) $ids[0];
+            return array('id' => $id, 'name' => (string) $choices[$id]);
+        }
+        return array('id' => 0, 'name' => '');
+    }
+
+    /**
+     * ticket.close on this ticket's role, and Ticket::isCloseable() === true.
+     * A warning string (open tasks, required fields) is not closeable.
+     */
+    function canClose($ticket, $staff) {
+        $role = $ticket->getRole($staff);
+        if (!$role || !$role->hasPerm(Ticket::PERM_CLOSE))
+            return false;
+        return $ticket->isCloseable() === true;
+    }
+
+    function defaultSignatureText($ticket, $staff) {
+        $choice = $this->signatureChoices($ticket, $staff);
+        if ($choice['default'] === 'mine' && $staff)
+            return (string) $staff->getSignature();
+        if ($choice['default'] === 'dept') {
+            $dept = $ticket->getDept();
+            if ($dept && $dept->isPublic())
+                return (string) $dept->getSignature();
+        }
+        return '';
+    }
+
+    function replyTemplateBody($ticket) {
+        $dept = $ticket->getDept();
+        if (!$dept || !($tpl = $dept->getTemplate()) || !($msg = $tpl->getReplyMsgTemplate()))
+            return '';
+        return (string) $msg->getBody();
+    }
+
+    /**
+     * Split the live ticket.reply body at the first %{response} and render
+     * each side with Ticket::replaceVars. The hash does not include this.
+     */
+    function templateInfo($ticket, $staff, $signatureText) {
+        $raw = $this->replyTemplateBody($ticket);
+        $parts = explode('%{response}', $raw, 2);
+        $before = $parts[0];
+        $after = (count($parts) > 1) ? $parts[1] : '';
+        $variables = array(
+            'signature' => (string) $signatureText,
+            'staff' => $staff,
+            'poster' => $staff,
+            'recipient' => $ticket->getOwner(),
+        );
+        $beforeRendered = $this->renderTemplateSide($ticket, $before, $variables);
+        $afterRendered = $this->renderTemplateSide($ticket, $after, $variables);
+        $first = $this->recipientFirstName($ticket);
+        $blob = $before . "\n" . $after;
+        $addsGreeting = (stripos($before, '%{recipient.name') !== false)
+            || (bool) preg_match('/\b(hi|hello|dear|hey)\b/i', $this->visiblePlain($before))
+            || $this->startsWithGreeting($this->visiblePlain($beforeRendered), $first);
+        $addsStaff = (stripos($blob, '%{poster') !== false)
+            || (stripos($blob, '%{staff') !== false);
+        $addsSignature = (stripos($blob, '%{signature') !== false);
+        return array(
+            'adds_greeting' => $addsGreeting ? true : false,
+            'greeting_rendered' => $addsGreeting ? $beforeRendered : '',
+            'adds_staff_name' => $addsStaff ? true : false,
+            'adds_signature' => $addsSignature ? true : false,
+            'before_response_rendered' => $beforeRendered,
+            'after_response_rendered' => $afterRendered,
+        );
+    }
+
+    function renderTemplateSide($ticket, $text, array $variables) {
+        if ($text === '')
+            return '';
+        $rendered = $ticket->replaceVars($text, $variables);
+        if (is_array($rendered))
+            $rendered = isset($rendered['body']) ? $rendered['body'] : '';
+        return (string) $rendered;
+    }
+
+    function recipientFirstName($ticket) {
+        $rendered = $ticket->replaceVars('%{recipient.name.first}', array(
+            'recipient' => $ticket->getOwner(),
+        ));
+        if (is_array($rendered))
+            $rendered = '';
+        return $this->visiblePlain($rendered);
+    }
+
+    function visiblePlain($html) {
+        $text = html_entity_decode(strip_tags((string) $html), ENT_QUOTES, 'UTF-8');
+        $text = str_replace("\xc2\xa0", ' ', $text);
+        $text = preg_replace('/\s+/u', ' ', $text);
+        return trim((string) $text);
+    }
+
+    function startsWithGreeting($text, $firstName) {
+        if (preg_match('/^(hi|hello|dear|hey)\b/iu', (string) $text))
+            return true;
+        $firstName = trim((string) $firstName);
+        if ($firstName === '')
+            return false;
+        return (bool) preg_match('/^' . preg_quote($firstName, '/') . '\s*,/iu', (string) $text);
+    }
+
+    function endsWithSignoff($text, $staffName) {
+        $text = rtrim((string) $text);
+        $staffName = trim((string) $staffName);
+        if ($staffName !== '' && preg_match('/' . preg_quote($staffName, '/') . '\s*$/iu', $text))
+            return true;
+        return (bool) preg_match('/(?:thanks|thank you|regards|sincerely|best|cheers)[\s,!.]*$/iu', $text);
+    }
+
+    /**
+     * Warnings are informational. They are not part of the preview hash.
+     */
+    function previewWarnings($ticket, $staff, array $resolved, array $template) {
+        $warnings = array();
+        $text = $this->visiblePlain($resolved['response_html']);
+        if (!empty($template['adds_greeting'])
+                && $this->startsWithGreeting($text, $this->recipientFirstName($ticket)))
+            $warnings[] = 'The department template already starts with a greeting. This response also starts with one.';
+        if (!empty($template['adds_staff_name'])) {
+            $name = $staff ? trim((string) $staff->getName()) : '';
+            if ($this->endsWithSignoff($text, $name))
+                $warnings[] = 'The department template already adds the staff name. This response also ends with a name or a sign-off.';
+        }
+        if (isset($resolved['signature']) && $resolved['signature'] !== 'none') {
+            $sig = '';
+            if ($resolved['signature'] === 'mine' && $staff)
+                $sig = (string) $staff->getSignature();
+            elseif ($resolved['signature'] === 'dept') {
+                $dept = $ticket->getDept();
+                if ($dept)
+                    $sig = (string) $dept->getSignature();
+            }
+            $sigText = $this->visiblePlain($sig);
+            if ($sigText !== '' && mb_stripos($text, $sigText) !== false)
+                $warnings[] = 'A signature is selected and this response already includes that signature text.';
+        }
+        return $warnings;
+    }
+
+    /**
+     * The column ThreadEntry::create writes. A string body is wrapped once.
+     * A note is already a TextThreadEntryBody, so pass that text here and
+     * this wraps it the same way create does when the body is a string of
+     * that class. Notes are passed as TextThreadEntryBody by the bridge,
+     * and create does not wrap an object again. getClean is the same call.
+     */
+    function expectedReplyColumn($clean) {
+        global $cfg;
+        if ($cfg && $cfg->isRichTextEnabled())
+            $body = new HtmlThreadEntryBody((string) $clean);
+        else
+            $body = new TextThreadEntryBody((string) $clean);
+        return $this->storedColumn($body);
+    }
+
+    function expectedNoteColumn($text) {
+        return $this->storedColumn(new TextThreadEntryBody((string) $text));
+    }
+
+    function storedColumn($body) {
+        $stored = Format::strip_emoticons($body->getClean());
+        if (!$stored)
+            $stored = '-';
+        return Format::stripExternalImages($stored);
+    }
+
+    function columnHash($text) {
+        return hash('sha256', $this->normalizeNewlines($text));
+    }
+
+    function normalizeNewlines($text) {
+        return str_replace(array("\r\n", "\r"), "\n", (string) $text);
+    }
+
+    function threadEntryRow($entryId) {
+        if (!$entryId)
+            return null;
+        $sql = 'SELECT id, type, staff_id, body, format FROM ' . THREAD_ENTRY_TABLE
+            . ' WHERE id=' . db_input((int) $entryId);
+        if (!($res = db_query($sql)) || !($row = db_fetch_array($res)))
+            return null;
+        return $row;
+    }
+
+    function ticketStatusIdFromDb($ticketId) {
+        $sql = 'SELECT status_id FROM ' . TICKET_TABLE
+            . ' WHERE ticket_id=' . db_input((int) $ticketId);
+        $res = db_query($sql);
+        if (!$res)
+            return 0;
+        return (int) db_result($res);
+    }
+
+    function writeStatusId($ticketId, $statusId) {
+        $sql = 'UPDATE ' . TICKET_TABLE . ' SET status_id=' . db_input((int) $statusId)
+            . ' WHERE ticket_id=' . db_input((int) $ticketId);
+        db_query($sql);
+    }
+
+    function otherEnabledStatusId($current) {
+        foreach (TicketStatusList::getStatuses(array('states' => array('open', 'closed'))) as $status) {
+            if (!$status->isEnabled())
+                continue;
+            if ((int) $status->getId() !== (int) $current)
+                return (int) $status->getId();
+        }
+        return 0;
+    }
+
+    /**
+     * Fresh SQL read. Reply keys are true when this call did not post a
+     * reply (the status route): all_passed then means the status and the
+     * note matched. The verify_status fault changes status_id for this
+     * read only, then puts the original id back.
+     */
+    function readVerification($ticketId, $staffId, $responseId, $noteId, array $expect, $allowFault) {
+        $restore = null;
+        if ($allowFault && $this->testFault() === 'verify_status') {
+            $current = $this->ticketStatusIdFromDb($ticketId);
+            $other = $this->otherEnabledStatusId($current);
+            if ($other && $other !== $current) {
+                $this->writeStatusId($ticketId, $other);
+                $restore = $current;
+            }
+        }
+        try {
+            $statusActual = $this->ticketStatusIdFromDb($ticketId);
+            $requireReply = !empty($expect['require_reply']);
+            $reply = ($requireReply && $responseId) ? $this->threadEntryRow($responseId) : null;
+            $note = $noteId ? $this->threadEntryRow($noteId) : null;
+            if ($requireReply) {
+                $replyRecorded = (bool) ($reply && strtoupper((string) $reply['type']) === 'R');
+                $replyByStaff = $replyRecorded && (int) $reply['staff_id'] === (int) $staffId;
+                $replyHash = $reply ? $this->columnHash((string) $reply['body']) : '';
+                $replyBodyMatches = $replyRecorded
+                    && hash_equals((string) $expect['reply_sha256'], $replyHash);
+            } else {
+                // No reply was part of this call. Those checks are not failures.
+                $replyRecorded = true;
+                $replyByStaff = true;
+                $replyBodyMatches = true;
+            }
+            $noteRecorded = (bool) ($note && strtoupper((string) $note['type']) === 'N');
+            $noteHash = $note ? $this->columnHash((string) $note['body']) : '';
+            $noteExact = $noteRecorded && hash_equals((string) $expect['note_sha256'], $noteHash);
+            $statusExpected = (int) $expect['status_id'];
+            $statusMatches = ((int) $statusActual === $statusExpected);
+            $all = $replyRecorded && $replyByStaff && $replyBodyMatches
+                && $noteRecorded && $noteExact && $statusMatches;
+            return array(
+                'reply_recorded' => $replyRecorded ? true : false,
+                'reply_by_staff' => $replyByStaff ? true : false,
+                'reply_body_matches' => $replyBodyMatches ? true : false,
+                'note_recorded' => $noteRecorded ? true : false,
+                'note_text_exact' => $noteExact ? true : false,
+                'status_expected' => $statusExpected,
+                'status_actual' => (int) $statusActual,
+                'status_matches' => $statusMatches ? true : false,
+                'all_passed' => $all ? true : false,
+            );
+        } finally {
+            if ($restore !== null)
+                $this->writeStatusId($ticketId, $restore);
+        }
+    }
+
+    function packResult($json, array $expect) {
+        return $this->encode(array(
+            'body' => (string) $json,
+            'expect' => array(
+                'reply_sha256' => (string) $expect['reply_sha256'],
+                'note_sha256' => (string) $expect['note_sha256'],
+                'status_id' => (int) $expect['status_id'],
+                'require_reply' => !empty($expect['require_reply']),
+            ),
+        ));
+    }
+
+    /**
+     * Re-read the stored ids. The new request body is not used. When the
+     * verification block is unchanged, the original HTTP bytes are returned.
+     * When it differs, a new body is returned and nothing is posted.
+     */
+    function replayVerify($row, array $done) {
+        $http = $done[0];
+        $body = $done[1];
+        if (!$row || !isset($row['result_json']))
+            return array($http, $body);
+        $wrapped = json_decode((string) $row['result_json'], true);
+        if (!is_array($wrapped) || !isset($wrapped['expect']) || !is_array($wrapped['expect'])
+                || !isset($wrapped['body']) || !is_string($wrapped['body']))
+            return array($http, $body);
+        $expect = $wrapped['expect'];
+        $verification = $this->readVerification(
+            (int) $row['ticket_id'],
+            (int) $row['staff_id'],
+            $row['response_entry_id'] ? (int) $row['response_entry_id'] : 0,
+            $row['note_entry_id'] ? (int) $row['note_entry_id'] : 0,
+            $expect,
+            false);
+        $old = json_decode($wrapped['body'], true);
+        $oldV = (is_array($old) && isset($old['verification']) && is_array($old['verification']))
+            ? $old['verification'] : null;
+        if ($oldV !== null && $this->encode($oldV) === $this->encode($verification))
+            return array($http, $wrapped['body']);
+        if (!is_array($old))
+            return array($http, $body);
+        $old['verification'] = $verification;
+        if (!empty($verification['all_passed'])) {
+            $old['ok'] = true;
+            unset($old['error'], $old['message']);
+        } else {
+            $old['ok'] = false;
+            $old['error'] = 'verification_failed';
+            $old['message'] = $row['response_entry_id']
+                ? 'The reply was saved, but a fresh read did not match. Nothing was sent again.'
+                : 'The status was saved, but a fresh read did not match. Nothing was sent again.';
+            unset($old['mail']);
+        }
+        $code = !empty($verification['all_passed']) ? 200 : 500;
+        return array($code, $this->encode($old));
+    }
+
     // ---- ledger -----------------------------------------------------------
 
     function ledgerTable() {
@@ -1387,15 +2027,19 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     function ledgerMarkExecuting($requestId, $baseline) {
+        $this->ledgerMarkExecutingAs($requestId, $baseline, 'reserved', 'executing');
+    }
+
+    function ledgerMarkExecutingAs($requestId, $baseline, $from, $to) {
         $sql = 'UPDATE ' . $this->ledgerTable()
-            . ' SET status=' . db_input('executing')
+            . ' SET status=' . db_input($to)
             . ', executing_at=' . db_input(time())
             . ', baseline_entry_id=' . db_input((int) $baseline)
             . ' WHERE request_id=' . db_input($requestId)
-            . ' AND status=' . db_input('reserved');
+            . ' AND status=' . db_input($from);
         db_query($sql);
         $row = $this->ledgerFetch($requestId);
-        if (!$row || $row['status'] !== 'executing')
+        if (!$row || $row['status'] !== $to)
             $this->fail('already_done', 'This request id cannot be posted again.', 409);
     }
 
@@ -1488,10 +2132,19 @@ class WgsReplyBridgePlugin extends Plugin {
     function storedResult($row) {
         if (!$row || !isset($row['result_json']) || $row['result_json'] === '' || $row['result_json'] === null)
             return null;
+        $body = (string) $row['result_json'];
+        $decoded = json_decode($body, true);
+        // New rows wrap the HTTP bytes with the hashes a replay re-checks.
+        // Older rows, and mail-unknown rows, are the HTTP JSON itself.
+        if (is_array($decoded) && isset($decoded['body']) && is_string($decoded['body'])
+                && isset($decoded['expect']) && is_array($decoded['expect']))
+            $body = $decoded['body'];
         if ($row['status'] === 'completed')
-            return array(200, $row['result_json']);
-        if ($row['status'] === 'reply_state_unknown' || $row['status'] === 'reply_recorded_mail_unknown')
-            return array(500, $row['result_json']);
+            return array(200, $body);
+        if ($row['status'] === 'reply_state_unknown'
+                || $row['status'] === 'reply_recorded_mail_unknown'
+                || $row['status'] === 'verification_failed')
+            return array(500, $body);
         return null;
     }
 
@@ -1723,6 +2376,12 @@ class WgsReplyBridgePlugin extends Plugin {
         if ($this->testFault() === 'before_reply')
             throw new WgsReplyBridgeFault('before_reply');
 
+        // The resolved reply is what postReply stores. Verification hashes
+        // these, not the HTTP body, so a replay can re-check without the text.
+        $this->pendingClean = $resolved['clean'];
+        $this->pendingStatusId = (int) $resolved['reply_status_id'];
+        $this->pendingSummary = (string) $summary;
+
         $errors = array();
         // scp/tickets.php:200. $alert is true unless reply-to is none.
         // Claim stays at the method default (true): native auto-claim.
@@ -1946,8 +2605,42 @@ class WgsReplyBridgePlugin extends Plugin {
         $this->reloadTicket($ticket);
         if (!$response || !$response->getId())
             $response = $this->responseEntry($ticket, $responseId);
-        $json = $this->encode($this->sendPayload($ticket, $response, $note));
-        $this->ledgerComplete($requestId, $responseId, (int) $note->getId(), $json);
+        $row = $this->ledgerFetch($requestId);
+        $staffId = $row ? (int) $row['staff_id'] : 0;
+        $staff = $staffId ? Staff::lookup($staffId) : null;
+        if (!$staff)
+            $this->fail('staff_not_found', 'Staff member was not found.', 404);
+        $clean = ($this->pendingClean === null) ? '' : (string) $this->pendingClean;
+        $expect = array(
+            'reply_sha256' => $this->columnHash($this->expectedReplyColumn($clean)),
+            'note_sha256' => $this->columnHash($this->expectedNoteColumn(
+                $this->noteText($staff, $this->pendingSummary))),
+            'status_id' => (int) ($this->pendingStatusId ? $this->pendingStatusId : $ticket->getStatusId()),
+            'require_reply' => true,
+        );
+        $noteId = (int) $note->getId();
+        // verify_status, when the staging constant names it, pokes the
+        // status around this read only. The ticket is restored before return.
+        $verification = $this->readVerification(
+            (int) $ticket->getId(), $staffId, (int) $responseId, $noteId, $expect, true);
+        if (empty($verification['all_passed'])) {
+            $body = array(
+                'ok' => false,
+                'error' => 'verification_failed',
+                'message' => 'The reply was saved, but a fresh read did not match. Nothing was sent again.',
+                'response_entry_id' => (int) $responseId,
+                'note_entry_id' => $noteId,
+                'verification' => $verification,
+            );
+            $json = $this->encode($body);
+            $this->ledgerStoreResult($requestId, 'verification_failed', (int) $responseId, $noteId,
+                $this->packResult($json, $expect), 'reply_recorded');
+            $this->respond(500, $json);
+        }
+        $payload = $this->sendPayload($ticket, $response, $note);
+        $payload['verification'] = $verification;
+        $json = $this->encode($payload);
+        $this->ledgerComplete($requestId, $responseId, $noteId, $this->packResult($json, $expect));
         $row = $this->ledgerFetch($requestId);
         if (!$row || $row['status'] !== 'completed')
             $this->fail('partial_note_missing',
