@@ -109,6 +109,24 @@ try {
     case 'ledger':
         bridge_out(bridge_ledger($argv[2]));
         break;
+    case 'render-config':
+        bridge_out(bridge_render_config());
+        break;
+    case 'verify-compare':
+        bridge_out(bridge_verify_compare());
+        break;
+    case 'grant-close-no-reply':
+        bridge_out(bridge_grant_close_no_reply());
+        break;
+    case 'restore-close-no-reply':
+        bridge_out(bridge_restore_close_no_reply(
+            isset($argv[2]) ? (int) $argv[2] : 0,
+            isset($argv[3]) ? (int) $argv[3] : 0,
+            isset($argv[4]) ? (int) $argv[4] : 0,
+            isset($argv[5]) ? (int) $argv[5] : 0,
+            isset($argv[6]) ? (int) $argv[6] : 0
+        ));
+        break;
     default:
         bridge_fail('Unknown command.', array('noise' => $noise));
     }
@@ -202,6 +220,7 @@ function bridge_install($cidr) {
                 'allowed_ips' => $cidr,
                 'enabled' => 1,
                 'max_body_bytes' => (string) ($inst->getConfig()->get('max_body_bytes') ?: '8388608'),
+                'default_close_status' => bridge_close_status_id($inst->getConfig()),
             );
             if (!$inst->update($vars, $errors))
                 bridge_fail('Could not update the plugin instance.', array('errors' => $errors));
@@ -342,7 +361,7 @@ function bridge_fixtures() {
         if (!$staff || !$staff->isActive() || !$staff->getSignature())
             continue;
         $buckets = bridge_bucket($open, $staff);
-        if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 1 && count($buckets['collab']) >= 1) {
+        if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 6 && count($buckets['collab']) >= 1) {
             $reply = $staff;
             break;
         }
@@ -352,7 +371,7 @@ function bridge_fixtures() {
             if (!$staff->getSignature())
                 continue;
             $buckets = bridge_bucket($open, $staff);
-            if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 1 && count($buckets['collab']) >= 1) {
+            if (count($buckets['plain']) >= 3 && count($buckets['close']) >= 6 && count($buckets['collab']) >= 1) {
                 $reply = $staff;
                 break;
             }
@@ -426,10 +445,20 @@ function bridge_fixtures() {
         $threadVars = $candidate;
         break;
     }
+    $verify = $take($buckets['any']);
+    $verifyFault = $take($buckets['any']);
+    $statusChange = $take($buckets['close']);
+    $statusInterrupt = $take($buckets['close']);
+    $statusNote = $take($buckets['close']);
+    $replyExpect = $take($buckets['close']);
+    $requestReuse = $take($buckets['any']);
+    $templateProbe = $take($buckets['any']);
     if (!$plain1 || !$plain2 || !$plain3 || !$close || !$collab || !$stale
             || !$race || !$faultReply || !$faultNote || !$owner
             || !$beforeReply || !$twoNotes || !$bodyHash || !$due || !$planted
-            || !$threadVars)
+            || !$threadVars || !$verify || !$verifyFault || !$statusChange
+            || !$statusInterrupt || !$statusNote || !$replyExpect
+            || !$requestReuse || !$templateProbe)
         bridge_fail('Not enough distinct tickets for the reply staff.', array(
             'any' => count($buckets['any']),
             'close' => count($buckets['close']),
@@ -472,6 +501,8 @@ function bridge_fixtures() {
                 continue;
             if ($ticket->checkStaffPerm($staff, Ticket::PERM_REPLY))
                 continue;
+            if ($ticket->checkStaffPerm($staff, Ticket::PERM_CLOSE))
+                continue;
             if ($ticket->isChild() && $ticket->getMergeType() != 'visual')
                 continue;
             $noReplyStaff = $staff;
@@ -506,6 +537,14 @@ function bridge_fixtures() {
             'due_date' => bridge_brief($due),
             'planted' => bridge_brief($planted),
             'thread_vars' => bridge_brief($threadVars),
+            'verify' => bridge_brief($verify),
+            'verify_fault' => bridge_brief($verifyFault),
+            'status_change' => bridge_brief($statusChange),
+            'status_interrupt' => bridge_brief($statusInterrupt),
+            'status_note' => bridge_brief($statusNote),
+            'reply_expect' => bridge_brief($replyExpect),
+            'request_reuse' => bridge_brief($requestReuse),
+            'template_probe' => bridge_brief($templateProbe),
             'no_access' => bridge_brief($noAccessTicket),
             'no_reply' => bridge_brief($noReplyTicket),
         ),
@@ -664,6 +703,72 @@ function bridge_instance() {
 }
 
 /**
+ * ChoiceField stores the status id. Post that id back so a later save
+ * does not blank the field. The name is not required here.
+ */
+function bridge_close_status_id($cfg) {
+    $stored = $cfg ? $cfg->get('default_close_status') : null;
+    if (is_array($stored)) {
+        reset($stored);
+        $stored = key($stored);
+    }
+    if ($stored === null || $stored === '')
+        return '';
+    return (string) (int) $stored;
+}
+
+/**
+ * Render the instance Config form the way the admin page does.
+ * Returns flags only. If the shared secret appears in the HTML, this
+ * refuses and does not return the HTML.
+ */
+function bridge_render_config() {
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $inst = bridge_instance();
+    $cfg = $inst->getConfig();
+    $secret = (string) $cfg->get('shared_secret');
+    $form = $inst->getForm();
+    if (!$form)
+        bridge_fail('Config form did not load.');
+    $options = array();
+    ob_start();
+    include INCLUDE_DIR . 'staff/templates/simple-form.tmpl.php';
+    $html = ob_get_clean();
+    if ($secret !== '' && strpos($html, $secret) !== false)
+        bridge_fail('The rendered config page contains the shared secret. Refusing to return it.');
+    $needles = array(
+        'WGS Reply Bridge help',
+        'autocomplete="new-password"',
+        'Browsers may autofill',
+        'ip_not_allowed',
+        'auth_failed',
+        'stale_timestamp',
+        'verification_failed',
+        'MCP_MUX_ALLOW_ANONYMOUS',
+        'MCP_MUX_IDENTITIES_FILE',
+        'MCP_MUX_TOKEN',
+        'OSTICKET_BRIDGE_URL',
+        'OSTICKET_BRIDGE_SECRET',
+        'OSTICKET_BRIDGE_CONNECT_IP',
+        'OSTICKET_BRIDGE_TIMEOUT',
+        'OSTICKET_STAFF_IDENTITIES_FILE',
+        'staff_identities.json',
+        'set-secret.php',
+    );
+    $found = array();
+    foreach ($needles as $needle)
+        $found[$needle] = (strpos($html, $needle) !== false);
+    $found['disabled'] = (strpos($html, 'disabled.') !== false);
+    $found['Help heading'] = (strpos($html, 'Help</h3>') !== false);
+    return array(
+        'ok' => true,
+        'html_length' => strlen($html),
+        'secret_in_html' => false,
+        'found' => $found,
+    );
+}
+
+/**
  * Rewrite one non-secret setting. The decrypted secret is posted back so
  * the password field does not wipe it. The secret is not part of the output.
  */
@@ -679,6 +784,7 @@ function bridge_config($changes) {
         'allowed_ips' => (string) $cfg->get('allowed_ips'),
         'enabled' => $cfg->get('enabled') ? 1 : 0,
         'max_body_bytes' => (string) ($cfg->get('max_body_bytes') ?: '8388608'),
+        'default_close_status' => bridge_close_status_id($cfg),
     );
     foreach ($changes as $key => $value) {
         if (!array_key_exists($key, $vars) || $key === 'shared_secret')
@@ -791,8 +897,10 @@ function bridge_ledger($requestId) {
 function bridge_fault_constant($flag) {
     if ($flag === 'off')
         $flag = '';
-    if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail' && $flag !== 'before_reply')
-        bridge_fail('Fault must be after_reply, note_fail, before_reply, or off.');
+    if ($flag !== '' && $flag !== 'after_reply' && $flag !== 'note_fail'
+            && $flag !== 'before_reply' && $flag !== 'verify_status'
+            && $flag !== 'status_interrupt')
+        bridge_fail('Fault must be after_reply, note_fail, before_reply, verify_status, status_interrupt, or off.');
 
     $path = '/var/www/html/include/ost-config.php';
     $raw = file_get_contents($path);
@@ -936,4 +1044,177 @@ function bridge_write_reply_template($number) {
         'subject' => (string) $row['subject'],
         'body' => (string) $row['body'],
     );
+}
+
+function bridge_impl() {
+    $plugin = bridge_plugin();
+    if (!$plugin)
+        bridge_fail('Reply bridge plugin is not installed.');
+    $impl = $plugin->getImpl();
+    if (!$impl)
+        bridge_fail('Reply bridge plugin did not load.');
+    return $impl;
+}
+
+/**
+ * Calls the pure verifier with an injected snapshot. Reads one ticket
+ * before and after so a write would show up. Does not update the ticket.
+ */
+function bridge_verify_compare() {
+    $impl = bridge_impl();
+    $ticket = null;
+    foreach (Ticket::objects()->filter(array('status__state' => 'open')) as $candidate) {
+        $ticket = $candidate;
+        break;
+    }
+    if (!$ticket)
+        bridge_fail('No open ticket to prove the verifier does not write.');
+    $before = (int) $ticket->getStatusId();
+    $noteBody = $impl->expectedNoteColumn('Bridge pure verifier probe');
+    $snapshot = array(
+        'status_id' => 1,
+        'staff_id' => 0,
+        'reply' => null,
+        'note' => array(
+            'type' => 'N',
+            'staff_id' => 0,
+            'body' => $noteBody,
+        ),
+    );
+    $expect = array(
+        'reply_sha256' => '',
+        'note_sha256' => $impl->columnHash($noteBody),
+        'status_id' => 3,
+        'require_reply' => false,
+    );
+    $verification = $impl->compareVerification($snapshot, $expect);
+    $fresh = Ticket::lookup((int) $ticket->getId());
+    $after = $fresh ? (int) $fresh->getStatusId() : -1;
+    return array(
+        'ok' => true,
+        'ticket_number' => (string) $ticket->getNumber(),
+        'status_before' => $before,
+        'status_after' => $after,
+        'verification' => $verification,
+    );
+}
+
+/**
+ * Point adam at a role that can close and create, and cannot reply, for
+ * one closeable ticket's department. The suite restores it in the same test.
+ */
+function bridge_grant_close_no_reply() {
+    $staff = Staff::lookup('adam');
+    if (!$staff || !$staff->isActive())
+        bridge_fail('adam is not an active staff member.');
+    $ticket = null;
+    foreach (Ticket::objects()->filter(array('status__state' => 'open')) as $candidate) {
+        if (!$candidate->checkStaffPerm($staff))
+            continue;
+        if ($candidate->isChild() && $candidate->getMergeType() != 'visual')
+            continue;
+        if ($candidate->isCloseable() !== true)
+            continue;
+        $ticket = $candidate;
+        break;
+    }
+    if (!$ticket)
+        bridge_fail('No closeable open ticket that adam can open.');
+
+    $perms = JsonDataEncoder::encode(array(
+        'ticket.close' => 1,
+        'ticket.create' => 1,
+    ));
+    $role = Role::lookup(array('name' => 'Bridge close without reply'));
+    if ($role) {
+        $role->flags = Role::FLAG_ENABLED;
+        $role->permissions = $perms;
+        $role->notes = '';
+    } else {
+        $role = Role::create(array(
+            'flags' => Role::FLAG_ENABLED,
+            'name' => 'Bridge close without reply',
+            'permissions' => $perms,
+            'notes' => '',
+        ));
+    }
+    if (!$role->save(true))
+        bridge_fail('Could not save the close-without-reply role.');
+
+    $staffId = (int) $staff->getId();
+    $deptId = (int) $ticket->getDeptId();
+    $roleId = (int) $role->getId();
+    $access = StaffDeptAccess::lookup(array(
+        'staff_id' => $staffId,
+        'dept_id' => $deptId,
+    ));
+    $createdRow = 0;
+    $previousRoleId = 0;
+    if ($access) {
+        $previousRoleId = (int) $access->role_id;
+        $access->role_id = $roleId;
+        if (!$access->save())
+            bridge_fail('Could not point the department access at the temporary role.');
+    } else {
+        $createdRow = 1;
+        $access = StaffDeptAccess::create(array(
+            'staff_id' => $staffId,
+            'dept_id' => $deptId,
+            'role_id' => $roleId,
+            'flags' => 0,
+        ));
+        if (!$access->save())
+            bridge_fail('Could not add department access for the temporary role.');
+    }
+
+    $freshStaff = Staff::lookup($staffId);
+    $freshTicket = Ticket::lookup((int) $ticket->getId());
+    $effective = $freshTicket ? $freshTicket->getRole($freshStaff) : null;
+    return array(
+        'ok' => true,
+        'staff_id' => $staffId,
+        'staff_username' => (string) $freshStaff->getUserName(),
+        'ticket_number' => (string) $freshTicket->getNumber(),
+        'dept_id' => $deptId,
+        'previous_role_id' => $previousRoleId,
+        'created_row' => $createdRow,
+        'role_id' => $roleId,
+        'can_reply' => ($effective && $effective->hasPerm(Ticket::PERM_REPLY)) ? true : false,
+        'can_close' => ($effective && $effective->hasPerm(Ticket::PERM_CLOSE)) ? true : false,
+        'can_create' => ($effective && $effective->hasPerm(Ticket::PERM_CREATE)) ? true : false,
+        'closeable' => $freshTicket->isCloseable() === true,
+    );
+}
+
+function bridge_restore_close_no_reply($staffId, $deptId, $previousRoleId, $createdRow, $roleId) {
+    if ($staffId < 1 || $deptId < 1 || $roleId < 1)
+        bridge_fail('restore-close-no-reply needs staff, department, and role ids.');
+    if ($createdRow) {
+        db_query('DELETE FROM ' . STAFF_DEPT_TABLE
+            . ' WHERE staff_id=' . db_input($staffId)
+            . ' AND dept_id=' . db_input($deptId)
+            . ' AND role_id=' . db_input($roleId));
+    } else {
+        db_query('UPDATE ' . STAFF_DEPT_TABLE
+            . ' SET role_id=' . db_input($previousRoleId)
+            . ' WHERE staff_id=' . db_input($staffId)
+            . ' AND dept_id=' . db_input($deptId));
+    }
+    $deptLeft = (int) db_result(db_query(
+        'SELECT COUNT(*) FROM ' . STAFF_DEPT_TABLE . ' WHERE role_id=' . db_input($roleId)));
+    $staffLeft = (int) db_result(db_query(
+        'SELECT COUNT(*) FROM ' . STAFF_TABLE . ' WHERE role_id=' . db_input($roleId)));
+    if ($deptLeft || $staffLeft)
+        bridge_fail('The temporary role is still referenced.', array(
+            'role_id' => $roleId,
+            'dept_rows' => $deptLeft,
+            'staff_rows' => $staffLeft,
+        ));
+    db_query('DELETE FROM ' . ROLE_TABLE
+        . ' WHERE id=' . db_input($roleId)
+        . ' AND name=' . db_input('Bridge close without reply'));
+    $still = Role::lookup($roleId);
+    if ($still)
+        bridge_fail('The temporary role was not deleted.', array('role_id' => $roleId));
+    return array('ok' => true, 'role_deleted' => true);
 }

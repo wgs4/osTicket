@@ -26,6 +26,7 @@ CTL = "/var/www/html/include/plugins/wgs-reply-bridge/tests/staging-ctl.php"
 ALLOWED = "172.21.0.0/16"
 
 SECRET = ""
+INSTANCE_ID = 0
 results = []
 
 
@@ -278,7 +279,9 @@ def main():
     global SECRET
     say("deploying plugin")
     deploy()
+    global INSTANCE_ID
     installed = ctl(["install", ALLOWED])
+    INSTANCE_ID = int(installed.get("instance_id") or 0)
     say("install %s" % json.dumps({k: installed[k] for k in installed if k != "ok"}))
     ctl(["set-fault", "off"])
     ctl(["clear-fault-config"])
@@ -331,6 +334,21 @@ def main():
     check_due_preview(staff, tickets["due_date"])
     check_planted_config(staff, tickets["planted"])
     check_thread_vars(staff, tickets["thread_vars"])
+    check_verification(staff, tickets["verify"])
+    check_verify_fault(staff, tickets["verify_fault"])
+    check_default_close(staff, tickets["plain"])
+    check_can_close(fx["no_reply_staff"], tickets["no_reply"])
+    check_status_route(staff, tickets["status_change"])
+    check_template(staff, tickets["thread_vars"])
+    check_set_secret()
+    check_help_page()
+    check_status_interrupt(staff, tickets["status_interrupt"])
+    check_status_note_retry(staff, tickets["status_note"])
+    check_stored_expectations(staff, tickets["reply_expect"])
+    check_request_reused(staff, tickets["request_reuse"])
+    check_pure_verifier(staff, tickets["plain"])
+    check_status_choices_without_reply()
+    check_template_flags(staff, tickets["thread_vars"], tickets["template_probe"])
 
     say("")
     failed = [name for name, ok, _detail in results if not ok]
@@ -1599,6 +1617,767 @@ def check_thread_vars(staff, ticket):
     if problems:
         detail += "\n" + "\n".join(problems)
     record("23 thread.complete is unsupported and thread.lastmessage matches the mail", not problems, detail)
+
+
+def verification_problems(block, require_reply=True):
+    if not isinstance(block, dict):
+        return ["verification missing"]
+    problems = []
+    keys = (
+        "reply_recorded", "reply_by_staff", "reply_body_matches",
+        "note_recorded", "note_text_exact", "status_expected",
+        "status_actual", "status_matches", "all_passed",
+    )
+    for key in keys:
+        if key not in block:
+            problems.append("verification.%s missing" % key)
+    if block.get("all_passed") is not True:
+        problems.append("all_passed is %r" % block.get("all_passed"))
+    if require_reply and block.get("reply_body_matches") is not True:
+        problems.append("reply_body_matches is %r" % block.get("reply_body_matches"))
+    if block.get("note_text_exact") is not True:
+        problems.append("note_text_exact is %r" % block.get("note_text_exact"))
+    if block.get("status_matches") is not True:
+        problems.append("status %s vs %s" % (block.get("status_actual"), block.get("status_expected")))
+    return problems
+
+
+def check_verification(staff, ticket):
+    summary = "Verification must pass on a normal send."
+    marker = "Bridge verify %s" % uuid.uuid4().hex[:12]
+    fields = reply_body(staff, marker, summary, ticket)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": fields["response_html"],
+    })
+    problems = []
+    if preview["code"] != 200 or not preview["json"] or not preview["json"].get("ok"):
+        record("24 verification all_passed on a normal send", False,
+               "preview %s %s" % (preview["code"], preview["raw"][:400]))
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    before = ctl(["state", ticket["number"]])
+    sent = post("send", fields)
+    if sent["code"] != 200 or not sent["json"] or not sent["json"].get("ok"):
+        record("24 verification all_passed on a normal send", False,
+               "send %s %s" % (sent["code"], sent["raw"][:600]))
+        return
+    block = sent["json"].get("verification")
+    problems.extend(verification_problems(block))
+    if sent["json"].get("mail") != "handed_to_osticket":
+        problems.append("mail is %r" % sent["json"].get("mail"))
+    after = ctl(["state", ticket["number"]])
+    if after["counts"]["R"] != before["counts"]["R"] + 1:
+        problems.append("R count %s -> %s" % (before["counts"]["R"], after["counts"]["R"]))
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+        detail += "\n" + sent["raw"][:500]
+    record("24 verification all_passed on a normal send", not problems, detail)
+
+
+def check_verify_fault(staff, ticket):
+    summary = "This status read is forced to differ."
+    marker = "Bridge verify fault %s" % uuid.uuid4().hex[:12]
+    fields = reply_body(staff, marker, summary, ticket)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": fields["response_html"],
+    })
+    problems = []
+    if preview["code"] != 200 or not preview["json"] or not preview["json"].get("ok"):
+        record("25 verification_failed when status is forced to differ", False,
+               "preview %s %s" % (preview["code"], preview["raw"][:400]))
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    before = ctl(["state", ticket["number"]])
+    try:
+        ctl(["set-fault", "verify_status"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if sent["code"] != 500 or not sent["json"] or sent["json"].get("error") != "verification_failed":
+        problems.append("send %s %s" % (sent["code"], sent["raw"][:500]))
+    else:
+        block = sent["json"].get("verification") or {}
+        if block.get("all_passed") is not False:
+            problems.append("all_passed %r" % block.get("all_passed"))
+        if block.get("status_matches") is not False:
+            problems.append("status_matches %r (%s vs %s)" % (
+                block.get("status_matches"), block.get("status_actual"), block.get("status_expected")))
+        if sent["json"].get("mail") == "handed_to_osticket":
+            problems.append("failure claimed mail handoff")
+        if not sent["json"].get("response_entry_id") or not sent["json"].get("note_entry_id"):
+            problems.append("entry ids missing")
+    after = ctl(["state", ticket["number"]])
+    if after["status_id"] != before["status_id"]:
+        problems.append("status left at %s, was %s" % (after["status_id"], before["status_id"]))
+    if after["counts"]["R"] != before["counts"]["R"] + 1:
+        problems.append("R count %s -> %s" % (before["counts"]["R"], after["counts"]["R"]))
+    ledger = ctl(["ledger", sent["rid"]])
+    if ledger.get("status") != "verification_failed":
+        problems.append("ledger %s" % ledger.get("status"))
+    replay = post("send", {}, rid=sent["rid"])
+    replayed = ctl(["state", ticket["number"]])
+    if replayed["counts"]["R"] != after["counts"]["R"]:
+        problems.append("replay posted another reply")
+    if replay["code"] == 200 and replay["json"] and replay["json"].get("ok"):
+        again = (replay["json"].get("verification") or {}).get("all_passed")
+        if again is not True:
+            problems.append("replay all_passed %r" % again)
+    elif replay["code"] != 500:
+        problems.append("replay %s %s" % (replay["code"], replay["raw"][:300]))
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("25 verification_failed when status is forced to differ", not problems, detail)
+
+
+def check_default_close(staff, ticket):
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    problems = []
+    close = (options["json"] or {}).get("default_close_status") if options["json"] else None
+    if options["code"] != 200 or not isinstance(close, dict):
+        problems.append("options %s %s" % (options["code"], options["raw"][:400]))
+    elif close.get("name") != "Closed":
+        problems.append("default_close_status %r" % close)
+    elif not close.get("id"):
+        problems.append("default_close_status id missing %r" % close)
+    detail = "default_close_status %s" % (close if isinstance(close, dict) else None)
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("26 default_close_status is Closed", not problems, detail)
+
+
+def check_can_close(staff, ticket):
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    body = options["json"] or {}
+    problems = []
+    if options["code"] != 200 or not body.get("ok"):
+        problems.append("options %s %s" % (options["code"], options["raw"][:400]))
+    elif body.get("can_close") is not False:
+        problems.append("can_close %r for %s" % (body.get("can_close"), staff["username"]))
+    if "can_close" not in body and options["code"] == 200:
+        problems.append("can_close missing")
+    detail = "staff %s can_close %s" % (staff["username"], body.get("can_close"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("27 can_close is false without ticket.close", not problems, detail)
+
+
+def check_status_route(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    close = ((options["json"] or {}).get("default_close_status") or {})
+    problems = []
+    if options["code"] != 200 or close.get("name") != "Closed":
+        record("28 status route closes, reopens, and refuses no_change", False,
+               "options %s %s" % (options["code"], options["raw"][:400]))
+        return
+    same = post("status", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": before["status_id"],
+        "summary": "This must not change anything.",
+    })
+    if same["code"] != 409 or (same["json"] or {}).get("error") != "no_change":
+        problems.append("no_change %s %s" % (same["code"], same["raw"][:300]))
+    held = ctl(["state", ticket["number"]])
+    if held["status_id"] != before["status_id"] or held["last_entry_id"] != before["last_entry_id"]:
+        problems.append("no_change wrote %s -> %s" % (before["last_entry_id"], held["last_entry_id"]))
+    close_summary = "Close it from the bridge."
+    closed = post("status", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": close["id"],
+        "summary": close_summary,
+    })
+    if closed["code"] != 200 or not (closed["json"] or {}).get("ok"):
+        problems.append("close %s %s" % (closed["code"], closed["raw"][:500]))
+    else:
+        problems.extend(verification_problems((closed["json"] or {}).get("verification"), False))
+        if (closed["json"].get("status") or {}).get("name") != "Closed":
+            problems.append("status name %r" % closed["json"].get("status"))
+        if closed["json"].get("mail") == "handed_to_osticket":
+            problems.append("status route claimed mail handoff")
+        note_id = closed["json"].get("note_entry_id")
+        entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        notes = [e for e in entries if e["type"] == "N" and e["id"] == note_id]
+        expect = "Status set to Closed using Claude by %s\n\n%s" % (staff["name"], close_summary)
+        if len(notes) != 1:
+            problems.append("close note count %s" % len([e for e in entries if e["type"] == "N"]))
+        elif notes[0]["body"].replace("\r\n", "\n") != expect:
+            problems.append("close note %r" % notes[0]["body"][:240])
+    reopen_summary = "Open it again from the bridge."
+    opened = post("status", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": before["status_id"],
+        "summary": reopen_summary,
+    })
+    if opened["code"] != 200 or not (opened["json"] or {}).get("ok"):
+        problems.append("reopen %s %s" % (opened["code"], opened["raw"][:500]))
+    else:
+        problems.extend(verification_problems((opened["json"] or {}).get("verification"), False))
+        if (opened["json"].get("status") or {}).get("id") != before["status_id"]:
+            problems.append("reopen status %r" % opened["json"].get("status"))
+    try:
+        ctl(["restore", ticket["number"], str(before["status_id"]), str(before["staff_id"])])
+    except (Exception, SystemExit) as exc:
+        problems.append("restore failed: %s" % exc)
+    detail = "ticket %s closed as %s then reopened" % (ticket["number"], close.get("id"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("28 status route closes, reopens, and refuses no_change", not problems, detail)
+
+
+def check_template(staff, ticket):
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    problems = []
+    template = (options["json"] or {}).get("template") if options["json"] else None
+    if options["code"] != 200 or not isinstance(template, dict):
+        problems.append("options %s %s" % (options["code"], options["raw"][:400]))
+    else:
+        if template.get("adds_greeting") is not True:
+            problems.append("adds_greeting %r" % template.get("adds_greeting"))
+        if template.get("adds_staff_name") is not True:
+            problems.append("adds_staff_name %r" % template.get("adds_staff_name"))
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": "<p>Hi there, the unit arrived damaged.</p>",
+    })
+    if preview["code"] != 200 or not (preview["json"] or {}).get("ok"):
+        problems.append("preview %s %s" % (preview["code"], preview["raw"][:400]))
+    else:
+        warnings = preview["json"].get("warnings")
+        if not isinstance(warnings, list) or not warnings:
+            problems.append("warnings %r" % warnings)
+        elif not any("greeting" in (w or "").lower() for w in warnings):
+            problems.append("no greeting warning %r" % warnings)
+        preview_template = preview["json"].get("template") or {}
+        if preview_template.get("adds_greeting") is not True:
+            problems.append("preview adds_greeting %r" % preview_template.get("adds_greeting"))
+    detail = "ticket %s" % ticket["number"]
+    if isinstance(template, dict):
+        detail += " greeting %s staff_name %s" % (
+            template.get("adds_greeting"), template.get("adds_staff_name"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("29 template flags and greeting warning", not problems, detail)
+
+
+def check_set_secret():
+    script = "/var/www/html/include/plugins/wgs-reply-bridge/cli/set-secret.php"
+    problems = []
+    proc = subprocess.run(
+        ["docker", "exec", "-i", "osticket_staging_web", "php", script, str(INSTANCE_ID)],
+        input=SECRET, capture_output=True, text=True,
+    )
+    combined = proc.stdout + proc.stderr
+    if SECRET and SECRET in combined:
+        problems.append("secret appeared in CLI output")
+    data = None
+    lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
+    if lines:
+        try:
+            data = json.loads(lines[-1])
+        except json.JSONDecodeError:
+            data = None
+    if proc.returncode != 0 or not data or data.get("readback_match") != "yes":
+        shown = proc.stdout
+        if SECRET:
+            shown = shown.replace(SECRET, "[secret]")
+        problems.append("cli rc %s %s" % (proc.returncode, shown[:300]))
+    elif data.get("instance_id") != INSTANCE_ID:
+        problems.append("instance %s" % data.get("instance_id"))
+    probe = subprocess.run(
+        ["docker", "exec", "osticket_staging_web", "sh", "-c",
+         "php -S 127.0.0.1:18099 -t /var/www/html/include/plugins/wgs-reply-bridge"
+         " >/tmp/wgs-sapi-probe.log 2>&1 & pid=$!; sleep 0.4; "
+         "code=$(curl -sS -o /tmp/wgs-sapi-body.txt -w '%{http_code}' "
+         "http://127.0.0.1:18099/cli/set-secret.php || true); "
+         "kill $pid >/dev/null 2>&1 || true; wait $pid >/dev/null 2>&1 || true; "
+         "echo HTTP:$code; echo BODY:; cat /tmp/wgs-sapi-body.txt"],
+        capture_output=True, text=True,
+    )
+    probe_text = probe.stdout + probe.stderr
+    if SECRET and SECRET in probe_text:
+        problems.append("secret appeared in non-CLI output")
+    if "HTTP:403" not in probe.stdout or "command line" not in probe.stdout:
+        shown = probe.stdout
+        if SECRET:
+            shown = shown.replace(SECRET, "[secret]")
+        problems.append("non-CLI %s" % shown[:300])
+    detail = "instance %s readback_match yes" % INSTANCE_ID
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("30 set-secret CLI readback_match yes and non-CLI refused", not problems, detail)
+
+
+def check_help_page():
+    page = ctl(["render-config"])
+    found = page.get("found") or {}
+    problems = []
+    required = (
+        "WGS Reply Bridge help",
+        "autocomplete=\"new-password\"",
+        "Browsers may autofill",
+        "ip_not_allowed",
+        "auth_failed",
+        "stale_timestamp",
+        "verification_failed",
+        "disabled",
+        "Help heading",
+        "MCP_MUX_ALLOW_ANONYMOUS",
+        "MCP_MUX_IDENTITIES_FILE",
+        "MCP_MUX_TOKEN",
+        "OSTICKET_BRIDGE_URL",
+        "OSTICKET_BRIDGE_SECRET",
+        "OSTICKET_BRIDGE_CONNECT_IP",
+        "OSTICKET_BRIDGE_TIMEOUT",
+        "OSTICKET_STAFF_IDENTITIES_FILE",
+        "staff_identities.json",
+        "set-secret.php",
+    )
+    for key in required:
+        if not found.get(key):
+            problems.append("missing %s" % key)
+    if page.get("secret_in_html") is not False:
+        problems.append("secret flag %r" % page.get("secret_in_html"))
+    if not page.get("html_length"):
+        problems.append("html was empty")
+    detail = "html %s bytes, secret_in_html %s" % (
+        page.get("html_length"), page.get("secret_in_html"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("31 help renders on the config form", not problems, detail)
+
+
+def restore_ticket(ticket, before, problems):
+    try:
+        ctl(["restore", ticket["number"], str(before["status_id"]), str(before["staff_id"])])
+    except (Exception, SystemExit) as exc:
+        problems.append("restore failed: %s" % exc)
+
+
+def check_status_interrupt(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    close = ((options["json"] or {}).get("default_close_status") or {})
+    problems = []
+    if options["code"] != 200 or close.get("name") != "Closed" or not close.get("id"):
+        record("32 interrupted status stays unknown after a reopen", False,
+               "options %s %s" % (options["code"], options["raw"][:400]))
+        return
+    if before["status_id"] == close["id"]:
+        record("32 interrupted status stays unknown after a reopen", False,
+               "ticket %s is already Closed" % ticket["number"])
+        return
+    summary = "Interrupt this status change."
+    payload = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": close["id"],
+        "summary": summary,
+    }
+    message = ("Whether this status change was saved is unknown. Check the ticket. "
+               "This request will not change the status again.")
+    sent = None
+    try:
+        ctl(["set-fault", "status_interrupt"])
+        sent = post("status", payload)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or (sent["json"] or {}).get("error") != "status_state_unknown":
+        problems.append("interrupt %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    elif (sent["json"] or {}).get("message") != message:
+        problems.append("message %r" % (sent["json"] or {}).get("message"))
+    held = ctl(["state", ticket["number"]])
+    if held["status_id"] != close["id"]:
+        problems.append("interrupt left status %s, want %s" % (held["status_id"], close["id"]))
+    if sent:
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "status_state_unknown":
+            problems.append("ledger %s" % ledger.get("status"))
+        if ledger.get("native_returned") not in (0, False):
+            problems.append("native_returned %s" % ledger.get("native_returned"))
+    opened = post("status", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": before["status_id"],
+        "summary": "Reopen after the unknown status change.",
+    })
+    if opened["code"] != 200 or not (opened["json"] or {}).get("ok"):
+        problems.append("reopen %s %s" % (opened["code"], opened["raw"][:400]))
+    retry = post("status", payload, rid=sent["rid"] if sent else None)
+    if not sent or retry["code"] != 500 or (retry["json"] or {}).get("error") != "status_state_unknown":
+        problems.append("retry %s %s" % (retry["code"], retry["raw"][:400]))
+    elif retry["raw"] != sent["raw"]:
+        problems.append("retry body differs from the stored result")
+    after = ctl(["state", ticket["number"]])
+    if after["status_id"] != before["status_id"]:
+        problems.append("retry left status %s, want the reopened %s" % (
+            after["status_id"], before["status_id"]))
+    restore_ticket(ticket, before, problems)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("32 interrupted status stays unknown after a reopen", not problems, detail)
+
+
+def check_status_note_retry(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    close = ((options["json"] or {}).get("default_close_status") or {})
+    problems = []
+    if options["code"] != 200 or close.get("name") != "Closed" or not close.get("id"):
+        record("33 status note failure retries only the note", False,
+               "options %s %s" % (options["code"], options["raw"][:400]))
+        return
+    summary = "The note is posted on the retry."
+    payload = {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": close["id"],
+        "summary": summary,
+    }
+    sent = None
+    try:
+        ctl(["set-fault", "note_fail"])
+        sent = post("status", payload)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or (sent["json"] or {}).get("error") != "partial_note_missing":
+        problems.append("first %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    elif (sent["json"] or {}).get("message") != "The status was saved but the internal note was not.":
+        problems.append("message %r" % sent["json"].get("message"))
+    held = ctl(["state", ticket["number"]])
+    if held["status_id"] != close["id"]:
+        problems.append("status after failure %s, want %s" % (held["status_id"], close["id"]))
+    if held["counts"]["R"] != before["counts"]["R"]:
+        problems.append("R changed on the status call")
+    if sent:
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "status_applied" or ledger.get("native_returned") != 1:
+            problems.append("ledger %s native %s" % (ledger.get("status"), ledger.get("native_returned")))
+        if ledger.get("note_entry_id"):
+            problems.append("note id was stored before the note existed")
+    retry = post("status", payload, rid=sent["rid"] if sent else None)
+    if retry["code"] != 200 or not (retry["json"] or {}).get("ok"):
+        problems.append("retry %s %s" % (retry["code"], retry["raw"][:500]))
+    else:
+        problems.extend(verification_problems(retry["json"].get("verification"), False))
+        note_id = retry["json"].get("note_entry_id")
+        entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        notes = [e for e in entries if e["type"] == "N" and e["id"] == note_id]
+        expect = "Status set to Closed using Claude by %s\n\n%s" % (staff["name"], summary)
+        if len(notes) != 1:
+            problems.append("retry note count %s" % len(notes))
+        elif notes[0]["body"].replace("\r\n", "\n") != expect:
+            problems.append("retry note %r" % notes[0]["body"][:240])
+        if [e for e in entries if e["type"] == "R"]:
+            problems.append("retry posted a reply")
+    after = ctl(["state", ticket["number"]])
+    if after["status_id"] != close["id"]:
+        problems.append("note retry changed status to %s" % after["status_id"])
+    if after["counts"]["R"] != before["counts"]["R"]:
+        problems.append("R %s -> %s" % (before["counts"]["R"], after["counts"]["R"]))
+    if sent and retry["code"] == 200:
+        again = post("status", {}, rid=sent["rid"])
+        final = ctl(["state", ticket["number"]])
+        if again["code"] != 200 or not (again["json"] or {}).get("ok"):
+            problems.append("stored retry %s %s" % (again["code"], again["raw"][:300]))
+        if final["counts"]["N"] != after["counts"]["N"]:
+            problems.append("stored retry posted another note")
+    restore_ticket(ticket, before, problems)
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("33 status note failure retries only the note", not problems, detail)
+
+
+def check_stored_expectations(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    summary = "Expect the original open status."
+    marker = "Bridge stored expect %s" % uuid.uuid4().hex[:12]
+    fields = reply_body(staff, marker, summary, ticket)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": fields["response_html"],
+    })
+    problems = []
+    if preview["code"] != 200 or not (preview["json"] or {}).get("ok"):
+        record("34 reply recovery keeps the stored status", False,
+               "preview %s %s" % (preview["code"], preview["raw"][:400]))
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    options = post("options", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+    })
+    close = ((options["json"] or {}).get("default_close_status") or {})
+    if close.get("name") != "Closed" or not close.get("id"):
+        problems.append("close status %r" % close)
+    sent = None
+    try:
+        ctl(["set-fault", "note_fail"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or (sent["json"] or {}).get("error") != "partial_note_missing":
+        problems.append("send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    closed = post("status", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "status_id": close.get("id"),
+        "summary": "Close after the reply was saved.",
+    })
+    if closed["code"] != 200 or not (closed["json"] or {}).get("ok"):
+        problems.append("close %s %s" % (closed["code"], closed["raw"][:400]))
+    retry = post("send", fields, rid=sent["rid"] if sent else None)
+    block = (retry["json"] or {}).get("verification") or {}
+    if retry["code"] != 500 or (retry["json"] or {}).get("error") != "verification_failed":
+        problems.append("retry %s %s" % (retry["code"], retry["raw"][:500]))
+    else:
+        if block.get("status_matches") is not False:
+            problems.append("status_matches %r" % block.get("status_matches"))
+        if block.get("all_passed") is not False:
+            problems.append("all_passed %r" % block.get("all_passed"))
+        if block.get("status_expected") != before["status_id"]:
+            problems.append("expected %s, first status was %s" % (
+                block.get("status_expected"), before["status_id"]))
+        if block.get("status_actual") != close.get("id"):
+            problems.append("actual %s, closed id %s" % (block.get("status_actual"), close.get("id")))
+    after = ctl(["state", ticket["number"]])
+    if after["counts"]["R"] != before["counts"]["R"] + 1:
+        problems.append("R %s -> %s" % (before["counts"]["R"], after["counts"]["R"]))
+    if sent and retry.get("json") and retry["json"].get("note_entry_id"):
+        entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        notes = [e for e in entries if e["id"] == retry["json"]["note_entry_id"]]
+        expect = "Reply sent using Claude by %s\n\n%s" % (staff["name"], summary)
+        if len(notes) != 1 or notes[0]["body"].replace("\r\n", "\n") != expect:
+            problems.append("stored note was not posted")
+    restore_ticket(ticket, before, problems)
+    detail = "ticket %s open %s" % (ticket["number"], before["status_id"])
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("34 reply recovery keeps the stored status", not problems, detail)
+
+
+def check_request_reused(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    summary = "Original summary for this request."
+    marker = "Bridge reuse %s" % uuid.uuid4().hex[:12]
+    fields = reply_body(staff, marker, summary, ticket)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": fields["response_html"],
+    })
+    problems = []
+    if preview["code"] != 200 or not (preview["json"] or {}).get("ok"):
+        record("35 request_id_reused does not post", False,
+               "preview %s %s" % (preview["code"], preview["raw"][:400]))
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    sent = None
+    try:
+        ctl(["set-fault", "note_fail"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or (sent["json"] or {}).get("error") != "partial_note_missing":
+        problems.append("send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    saved = ctl(["state", ticket["number"]])
+    other = dict(fields)
+    other["note_summary"] = "A different summary must not post."
+    reused = post("send", other, rid=sent["rid"] if sent else None)
+    if reused["code"] != 409 or (reused["json"] or {}).get("error") != "request_id_reused":
+        problems.append("reused %s %s" % (reused["code"], reused["raw"][:400]))
+    elif (reused["json"] or {}).get("message") != "This request id was already used with different inputs.":
+        problems.append("message %r" % reused["json"].get("message"))
+    mid = ctl(["state", ticket["number"]])
+    if mid["counts"]["R"] != saved["counts"]["R"] or mid["last_entry_id"] != saved["last_entry_id"]:
+        problems.append("mismatched retry wrote on the ticket")
+    if sent:
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "reply_recorded" or ledger.get("note_entry_id"):
+            problems.append("ledger changed to %s note %s" % (
+                ledger.get("status"), ledger.get("note_entry_id")))
+    retry = post("send", fields, rid=sent["rid"] if sent else None)
+    if retry["code"] != 200 or not (retry["json"] or {}).get("ok"):
+        problems.append("original retry %s %s" % (retry["code"], retry["raw"][:500]))
+    else:
+        problems.extend(verification_problems(retry["json"].get("verification")))
+        entries = ctl(["entries", ticket["number"], str(before["last_entry_id"])])["entries"]
+        note_id = retry["json"].get("note_entry_id")
+        notes = [e for e in entries if e["id"] == note_id]
+        expect = "Reply sent using Claude by %s\n\n%s" % (staff["name"], summary)
+        if len(notes) != 1 or notes[0]["body"].replace("\r\n", "\n") != expect:
+            problems.append("original note was not the stored summary")
+        if len([e for e in entries if e["type"] == "R"]) != 1:
+            problems.append("reply count %s" % len([e for e in entries if e["type"] == "R"]))
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("35 request_id_reused does not post", not problems, detail)
+
+
+def check_pure_verifier(staff, ticket):
+    del staff
+    before = ctl(["state", ticket["number"]])
+    compared = ctl(["verify-compare"])
+    after = ctl(["state", ticket["number"]])
+    block = compared.get("verification") or {}
+    problems = []
+    if block.get("status_matches") is not False:
+        problems.append("status_matches %r" % block.get("status_matches"))
+    if block.get("all_passed") is not False:
+        problems.append("all_passed %r" % block.get("all_passed"))
+    if block.get("note_text_exact") is not True:
+        problems.append("note_text_exact %r" % block.get("note_text_exact"))
+    if block.get("status_expected") != 3 or block.get("status_actual") != 1:
+        problems.append("expected %s actual %s" % (
+            block.get("status_expected"), block.get("status_actual")))
+    if compared.get("status_before") != compared.get("status_after"):
+        problems.append("verifier ticket %s moved %s -> %s" % (
+            compared.get("ticket_number"), compared.get("status_before"), compared.get("status_after")))
+    if after["status_id"] != before["status_id"] or after["last_entry_id"] != before["last_entry_id"]:
+        problems.append("suite ticket changed")
+    if after["counts"] != before["counts"]:
+        problems.append("counts changed")
+    detail = "injected status 1 vs 3 on %s" % compared.get("ticket_number")
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("36 pure verifier reports a mismatch without writing", not problems, detail)
+
+
+def check_status_choices_without_reply():
+    grant = None
+    problems = []
+    try:
+        grant = ctl(["grant-close-no-reply"])
+        if grant.get("can_reply") or not grant.get("can_close") or not grant.get("can_create"):
+            problems.append("effective perms reply %s close %s create %s" % (
+                grant.get("can_reply"), grant.get("can_close"), grant.get("can_create")))
+        if not grant.get("closeable"):
+            problems.append("ticket is not closeable")
+        options = post("options", {
+            "ticket_number": grant["ticket_number"],
+            "staff_username": grant["staff_username"],
+        })
+        body = options["json"] or {}
+        if options["code"] != 200 or not body.get("ok"):
+            problems.append("options %s %s" % (options["code"], options["raw"][:500]))
+        else:
+            if body.get("can_reply") is not False:
+                problems.append("can_reply %r" % body.get("can_reply"))
+            if body.get("reason") != "no_reply_permission":
+                problems.append("reason %r" % body.get("reason"))
+            statuses = (body.get("statuses") or {}).get("options")
+            if statuses:
+                problems.append("reply statuses %s" % statuses)
+            choices = (body.get("status_choices") or {}).get("options") or []
+            closed = [item for item in choices
+                      if item.get("state") == "closed" and item.get("name") == "Closed"]
+            opened = [item for item in choices if item.get("state") == "open"]
+            if not closed:
+                problems.append("no Closed choice %s" % choices)
+            if not opened:
+                problems.append("no open choice %s" % choices)
+    finally:
+        if grant and grant.get("role_id"):
+            try:
+                restored = ctl([
+                    "restore-close-no-reply",
+                    str(grant["staff_id"]),
+                    str(grant["dept_id"]),
+                    str(grant["previous_role_id"]),
+                    str(grant["created_row"]),
+                    str(grant["role_id"]),
+                ])
+                if not restored.get("role_deleted"):
+                    problems.append("role was not deleted")
+            except (Exception, SystemExit) as exc:
+                problems.append("restore role failed: %s" % exc)
+    detail = "staff %s ticket %s" % (
+        (grant or {}).get("staff_username"), (grant or {}).get("ticket_number"))
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("37 status_choices without reply permission", not problems, detail)
+
+
+def check_template_flags(staff, live, probe):
+    problems = []
+    live_opts = post("options", {
+        "ticket_number": live["number"],
+        "staff_username": staff["username"],
+    })
+    template = (live_opts["json"] or {}).get("template") if live_opts["json"] else None
+    if live_opts["code"] != 200 or not isinstance(template, dict):
+        problems.append("live options %s %s" % (live_opts["code"], live_opts["raw"][:400]))
+    else:
+        confidence = template.get("confidence") or {}
+        if template.get("adds_greeting") is not True or template.get("adds_staff_name") is not True:
+            problems.append("live greeting %r staff %r" % (
+                template.get("adds_greeting"), template.get("adds_staff_name")))
+        if confidence.get("adds_greeting") != "certain" or confidence.get("adds_staff_name") != "certain":
+            problems.append("live confidence %r" % confidence)
+    original = ctl(["reply-template", probe["number"]])
+    try:
+        write_template(
+            probe["number"],
+            original["subject"],
+            "<p>Please say hello when you arrive</p><p>%{response}</p><p>%{staff.phone}</p>",
+        )
+        probed = post("options", {
+            "ticket_number": probe["number"],
+            "staff_username": staff["username"],
+        })
+        flags = (probed["json"] or {}).get("template") if probed["json"] else None
+        if probed["code"] != 200 or not isinstance(flags, dict):
+            problems.append("probe options %s %s" % (probed["code"], probed["raw"][:400]))
+        else:
+            confidence = flags.get("confidence") or {}
+            if flags.get("adds_greeting") is not False:
+                problems.append("probe greeting %r" % flags.get("adds_greeting"))
+            if flags.get("adds_staff_name") is not False:
+                problems.append("probe staff %r rendered %r" % (
+                    flags.get("adds_staff_name"), (flags.get("before_response_rendered") or "")[:120]))
+            if confidence.get("adds_greeting") != "certain" or confidence.get("adds_staff_name") != "certain":
+                problems.append("probe confidence %r" % confidence)
+    finally:
+        restore_template(probe["number"], original, problems)
+    detail = "live %s probe %s" % (live["number"], probe["number"])
+    if problems:
+        detail += "\n" + "\n".join(problems)
+    record("38 greeting and staff-name flags stay narrow", not problems, detail)
 
 
 def cleanup_faults():

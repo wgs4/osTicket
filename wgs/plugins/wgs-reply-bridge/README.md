@@ -15,13 +15,35 @@ plugin at `include/plugins/wgs-reply-bridge/`.
 2. Admin Panel > Manage > Plugins. Install **WGS Reply Bridge**, then enable it.
 3. Add the instance and set:
    - **Shared secret.** HMAC key for the caller. A password field, so osTicket
-     encrypts it. Use at least 8 characters with upper, lower, and a digit or
-     symbol (the password-policy plugin applies).
+     encrypts it. The box uses `autocomplete="new-password"`. Browsers may
+     autofill a saved password there. Clear it, paste the secret, and save.
+     Use at least 8 characters with upper, lower, and a digit or symbol (the
+     password-policy plugin applies). From the osTicket host, the same write
+     can be done without a browser:
+
+     ```
+     printf '%s' "$SECRET" | php include/plugins/wgs-reply-bridge/cli/set-secret.php INSTANCE_ID
+     ```
+
+     The script reads stdin, stores the value through the field's own
+     `to_database`, reads it back through a fresh config, and prints only
+     lengths and `readback_match`. It never prints the secret. It refuses
+     every SAPI other than `cli`.
    - **Allowed IPs.** Comma-separated IPs or CIDR blocks. Default
      `192.168.1.193`, which is the osticket-mcp host. Checked with
      `osTicket::get_client_ip()`.
    - **Enabled.** Turns the routes off without disabling the plugin.
    - **Max body bytes.** Default `8388608`.
+   - **Default close status.** An enabled status whose state is closed. The
+     default is the status named Closed, or the lowest-id closed status when
+     that name is missing. The reply route does not apply it.
+     `reply_status_id` stays explicit and defaults to the current status.
+
+   A second MCP host is a second instance, with its own allowed IP and its
+   own secret. The Help section at the top of the Config tab describes
+   install, a second instance, the CLI, and the MCP files. osTicket 1.17
+   hardcodes the Instance and Config tabs, so the plugin cannot add a Help
+   tab without a core edit. The section is a FreeText field instead.
 4. The first request creates `<prefix>wgs_reply_ledger` if it is missing.
    An existing table gains `baseline_entry_id`, `executing_at`, and
    `native_returned` when those columns are absent, and `status` is widened
@@ -60,10 +82,11 @@ A browser session or cookie is never accepted. CSRF is not disabled.
 
 | Route | Body | Result |
 | --- | --- | --- |
-| `/api/wgs-reply/options` | `ticket_number`, `staff_username` | What the Post Reply form would show that agent right now |
+| `/api/wgs-reply/options` | `ticket_number`, `staff_username` | What the Post Reply form would show that agent right now, plus `default_close_status`, `can_close`, and `template` |
 | `/api/wgs-reply/canned` | those, plus `canned_id` (`original`, `lastmessage`, or a numeric id) | The expanded body and attachment names |
-| `/api/wgs-reply/preview` | the reply fields | Recipients, From, signature, status after, rendered `ticket.reply` subject and body, and `preview_hash`. Writes nothing |
-| `/api/wgs-reply/send` | the reply fields, `preview_hash`, and `note_summary` | Posts the reply, then the internal note |
+| `/api/wgs-reply/preview` | the reply fields | Recipients, From, signature, status after, rendered `ticket.reply` subject and body, `template`, `warnings`, and `preview_hash`. Writes nothing |
+| `/api/wgs-reply/send` | the reply fields, `preview_hash`, and `note_summary` | Posts the reply, then the internal note, then returns `verification` |
+| `/api/wgs-reply/status` | `ticket_number`, `staff_username`, `status_id`, `summary` | `Ticket::setStatus`, then one internal note. Does not require `ticket.reply` |
 
 Reply fields: `response_html` (required), `signature` (`none`, `mine`, `dept`;
 default is the agent's default when that choice exists), `reply_to` (`all`,
@@ -111,19 +134,29 @@ does not change either, and preview still renders them.
 
 Send order:
 
-1. A request id that already has a stored result returns those bytes and
-   does not read the ticket. `completed` is HTTP 200. `reply_state_unknown`
-   and `reply_recorded_mail_unknown` are HTTP 500. The same request id never
-   posts again.
+1. A request id that already has a stored result does not post again.
+   `completed` and `verification_failed` re-read the stored entry ids and
+   compare them to the stored hashes. When that block is unchanged, the
+   original HTTP bytes are returned and the new body is not interpreted.
+   When it differs, a new body is returned and nothing is sent again.
+   `reply_state_unknown` and `reply_recorded_mail_unknown` are HTTP 500 and
+   return the stored bytes without that re-read. `completed` is HTTP 200.
 2. Reject `no_access` and a missing ticket before any ticket payload.
 3. Take a MySQL advisory lock named `wgs_reply_<ticket_id>` (wait 10 seconds,
    refuse `busy` otherwise). Reload the ticket. Check the stored result again.
-4. Resume a row that already started, before the hash check. `reply_recorded`
-   with no note posts only the note. A captured response whose `postReply`
-   did not return normally posts the note if it is missing and returns
+4. Resume a row that already started, before the hash check. The retry's
+   ticket, staff, response HTML, note summary, and explicit `reply_status_id`
+   (null when it was omitted) must match the inputs stored before
+   `postReply`. A difference is `request_id_reused` (HTTP 409). The row is
+   left as it is, so the original inputs can still finish. An omitted status
+   is not filled in from the live ticket, so a later staff status change is
+   not a different request. `reply_recorded` with no note posts only the
+   stored note. A captured response whose `postReply` did not return
+   normally posts the stored note if it is missing and returns
    `mail_handoff_unknown`. `executing` with no response id becomes
    `reply_state_unknown`. Resume does not call `postReply`, and it does not
-   search the thread by staff, entry order, or note text.
+   search the thread by staff, entry order, or note text. A finished row
+   is not compared again: the stored bytes are returned as in step 1.
 5. Recompute the preview hash from live state and refuse `stale_preview` on
    any difference.
 6. Claim the request id as `reserved`, then `executing`, then acquire
@@ -133,8 +166,12 @@ Send order:
    own update as soon as osTicket saves the row, and the listener is removed
    when the call returns. `native_returned` is set only after `postReply`
    returns that same entry.
-8. Post the internal note and mark the row `completed`. The acting agent's
-   response draft is deleted when the response id is saved.
+8. Post the internal note. Re-read the reply, the note, and the status from
+   the database (not the in-memory ticket). When every check passes, mark
+   the row `completed` and return `verification`. When any check fails, the
+   row is `verification_failed` (HTTP 500) with the entry ids and the block.
+   Nothing is sent again. The acting agent's response draft is deleted when
+   the response id is saved.
 
 A `postReply` that saved a row and then threw, or that returned a different
 entry than the one captured, is `reply_recorded_mail_unknown`. The audit note
@@ -178,9 +215,75 @@ names that cannot be projected. Codes include `auth_failed`, `ip_not_allowed`,
 `no_reply_permission`, `ticket_not_found`, `locked_by_other`, `busy`,
 `stale_preview`, `preview_unsupported`, `invalid_option`, `banned_owner`,
 `empty_response`, `empty_summary`, `already_done`, `partial_note_missing`,
-`reply_state_unknown`, and `mail_handoff_unknown`. `no_access` and
+`reply_state_unknown`, `mail_handoff_unknown`, `verification_failed`,
+`no_change`, `no_close_permission`, `status_state_unknown`, and
+`request_id_reused`. `no_access` and
 `ticket_not_found` are returned before any ticket payload is built. That
 body is only `ok`, `error`, and `message`.
+
+`verification` is `{reply_recorded, reply_by_staff, reply_body_matches,
+note_recorded, note_text_exact, status_expected, status_actual,
+status_matches, all_passed}`. The reply and note checks compare a fresh SQL
+read to the sha256 values stored before the native call. The block does not
+include the note text. On a status change the reply checks are true because
+that call did not post a reply. `all_passed` then means the status and the
+note matched. A retry verifies against those stored expectations. It does
+not rebuild them from the retry body or from the live ticket status.
+
+`options.default_close_status` is `{id, name}`. `options.can_close` is true
+when the acting agent's role has `ticket.close` and `Ticket::isCloseable()`
+is true. The tools decide whether to close. The bridge does not close a
+reply unless `reply_status_id` says so.
+
+`template` is computed from the department's live `ticket.reply` body,
+split at the first `%{response}`, with each side rendered by
+`Ticket::replaceVars`. `adds_greeting` is true only when the rendered text
+before `%{response}` begins, after tags and whitespace are stripped, with
+Hi, Hello, Dear, Hey, or with the recipient's name followed by a comma.
+`adds_staff_name` is true for variables that render the staff member's
+name (`%{poster}`, `%{staff.name}`, and the name suffixes), not for
+`%{staff.phone}` or the other staff fields. `confidence` is `certain` or
+`likely` for each of those two flags. `preview.warnings` is a list. It
+flags a response that starts with Hi, Hello, Dear, Hey, or the recipient's
+first name when the template already adds a greeting, a response that ends
+with the staff name or a sign-off when the template adds the staff name,
+and a response that already contains the selected signature text. Warnings
+and these flags do not change the preview hash.
+
+`options.status_choices` lists the statuses the staff status dialog would
+offer for this agent and this ticket. Closed states need `ticket.close`
+and a closeable ticket. Open states need `ticket.close` or `ticket.create`.
+Reply permission is not required, so a staff member who cannot reply still
+receives `status_choices`. `statuses` stays the reply form's list and is
+empty when that form is not available. `no_access` is still only `ok`,
+`error`, and `message`.
+
+`POST /api/wgs-reply/status` uses the same permission checks as the staff
+status dialog. A closed target needs `ticket.close` and a closeable ticket.
+An open target needs `ticket.close` or `ticket.create`. A ticket that is
+already in that status is `no_change` (HTTP 409) and does not consume the
+request id. `Ticket::setStatus` is called with an empty comment so osTicket
+does not post its own note. The bridge note is:
+
+```
+Status set to <status name> using Claude by <staff full name>
+
+<summary>
+```
+
+`summary` is required. The note is posted with alerts off and does not
+change status again. The same request id is idempotent. The target status,
+the prior status, the summary hash, and the note text are stored before
+`setStatus`. `native_returned` is set only after that call returns. The
+note id is captured from `threadentry.created`, the same way a reply is.
+If the call does not record a return, the result is `status_state_unknown`
+(HTTP 500) and this request id never calls `setStatus` again, even after
+someone reopens the ticket. A retry returns that stored result. If the
+call returned and the note is missing, a retry posts only the note. A
+false return from `setStatus` is stored as `status_rejected` (HTTP 409)
+and is not tried again. A second instance is its own IP list and its own
+secret. A request is accepted by the first enabled instance whose IP
+matches and whose secret matches the signature.
 
 The ledger is a state machine. A row is never deleted once execution starts.
 
@@ -197,7 +300,22 @@ The ledger is a state machine. A row is never deleted once execution starts.
   the reply is there, add the missing note by hand. This request will not
   be sent again, and a later thread entry is not attached to it.
 - `completed`: the note id and the success JSON. `mail` is
-  `handed_to_osticket` only on this path.
+  `handed_to_osticket` only on a completed reply. A completed status change
+  has no `mail` field.
+- `verification_failed`: the reply or the status was saved, and a fresh read
+  did not match. HTTP 500. This request is not sent again.
+- `status_reserved`: the status request id is claimed, and `setStatus` has
+  not been called.
+- `status_executing`: the intent and the note text are stored, and
+  `setStatus` has been entered. `native_returned` is still 0.
+- `status_applied`: `setStatus` returned. `native_returned` is 1. The note
+  may still be missing. A retry posts only that note.
+- `status_state_unknown`: `setStatus` did not record a return. HTTP 500.
+  This request will not call `setStatus` again.
+- `status_rejected`: `setStatus` returned false. HTTP 409. This request
+  will not call `setStatus` again.
+
+A send does not resume a status row into `postReply`.
 
 `partial_note_missing` means the reply is saved and the note is not. It is
 never reported as success. The same request id posts the note and then
@@ -207,8 +325,12 @@ The constant `WGS_REPLY_BRIDGE_TEST_FAULTS` is a staging switch. Production
 does not define it, and the installer never defines it. The only honored
 values are `after_reply` (thrown from the response listener after the row is
 saved), `before_reply` (thrown after the row is `executing` and before
-`postReply`), and `note_fail` (the note is not posted). Anything else is
-ignored. A `test_fault` row in plugin config does nothing.
+`postReply`), `note_fail` (the note is not posted), `verify_status` (the
+in-memory status snapshot is forced to a different id; the ticket row is
+not written), and `status_interrupt` (thrown after `setStatus` returns and
+before `native_returned` is stored). Anything else is ignored. A
+`test_fault` row in plugin config does nothing. `verify_status` does not
+run on a replay.
 
 ## Known limits
 
@@ -240,8 +362,10 @@ ignored. A `test_fault` row in plugin config does nothing.
   turned into attachments by osTicket when the reply is posted, not during
   preview.
 - The ledger stores the request id, the state, the entry ids,
-  `native_returned`, and the response JSON. It does not store the secret,
-  the signature, or the message body. A crash after the response row is
+  `native_returned`, and the response JSON. Before `postReply` or
+  `setStatus`, it also stores the note text, the sha256 of the reply
+  column, the sha256 of the note column, and the expected status id. It
+  does not store the secret or the reply HTML. A crash after the response row is
   saved leaves `reply_recorded_mail_unknown` (or `reply_recorded` when
   `postReply` had already returned). The same request id finishes the note
   when it is missing and does not post a second reply. A crash before the
