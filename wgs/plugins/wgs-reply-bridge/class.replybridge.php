@@ -164,6 +164,18 @@ class WgsReplyBridgePlugin extends Plugin {
 
             // Resume before the hash check. A saved reply's own new entry,
             // or another send that landed after it, must not look stale.
+            // A started reply is compared to the inputs stored before
+            // postReply. The live ticket status is not one of those inputs.
+            // A reserved row has not started, and a finished row already
+            // returned above, so neither is compared here.
+            if ($row && ($row['status'] === 'executing'
+                    || $row['status'] === 'reply_recorded'
+                    || $row['status'] === 'reply_recorded_mail_unknown')) {
+                $fresh = $this->replyFreshIntent($in, $ticket, $staff, $summary);
+                if (!$this->sameIntent($this->storedIntent($row), $fresh))
+                    $this->fail('request_id_reused',
+                        'This request id was already used with different inputs.', 409);
+            }
             if ($row)
                 $this->resumeLedger($ticket, $staff, $summary, $row);
 
@@ -186,7 +198,20 @@ class WgsReplyBridgePlugin extends Plugin {
             $this->applyCollaborators($ticket, $resolved['ccs']);
             $vars = $this->replyVars($resolved);
             $baseline = $this->lastEntryId($ticket);
-            $this->ledgerMarkExecuting($requestId, $baseline);
+            // The digest, the note text, and the status id are fixed before
+            // postReply. A later retry verifies and posts from this plan,
+            // not from the retry body and not from the live status.
+            $noteText = $this->noteText($staff, $summary);
+            $expect = array(
+                'reply_sha256' => $this->columnHash($this->expectedReplyColumn($resolved['clean'])),
+                'note_text' => $noteText,
+                'note_sha256' => $this->columnHash($this->expectedNoteColumn($noteText)),
+                'status_id' => (int) $resolved['reply_status_id'],
+                'require_reply' => true,
+            );
+            $this->ledgerBeginNative(
+                $requestId, $baseline, 'reserved', 'executing',
+                $this->replyFreshIntent($in, $ticket, $staff, $summary), $expect);
             $this->correlateReply($ticket, $staff, $summary, $resolved, $vars, $requestId);
         } catch (WgsReplyBridgeFault $ex) {
             $this->settleNativeFailure($ticket, $staff, $summary, $requestId);
@@ -256,8 +281,29 @@ class WgsReplyBridgePlugin extends Plugin {
                 list($http, $body) = $this->replayVerify($row, $done);
                 $this->respond($http, $body);
             }
-            if ($row && $row['status'] !== 'status_reserved' && $row['status'] !== 'status_executing')
+            if ($row && $row['status'] !== 'status_reserved'
+                    && $row['status'] !== 'status_executing'
+                    && $row['status'] !== 'status_applied')
                 $this->fail('already_done', 'This request id cannot be posted again.', 409);
+
+            // A started status row is compared to the original request.
+            // The live ticket status is not part of that comparison, so a
+            // staff reopen does not look like a new operation.
+            if ($row && ($row['status'] === 'status_executing' || $row['status'] === 'status_applied')) {
+                $fresh = $this->statusFreshIntent($ticket, $staff, $status, $summary);
+                if (!$this->sameIntent($this->storedIntent($row), $fresh))
+                    $this->fail('request_id_reused',
+                        'This request id was already used with different inputs.', 409);
+            }
+
+            // setStatus was entered and did not record a return. Do not call
+            // it again, even when the ticket is no longer in the target status.
+            if ($row && $row['status'] === 'status_executing' && (int) $row['native_returned'] !== 1)
+                $this->storeStatusUnknown($requestId);
+
+            if ($row && $this->statusNativeReturned($row)) {
+                $this->finishStatusNote($ticket, $requestId);
+            }
 
             if ((int) $ticket->getStatusId() === (int) $status->getId()
                     && (!$row || $row['status'] === 'status_reserved'))
@@ -269,11 +315,11 @@ class WgsReplyBridgePlugin extends Plugin {
                 $this->ledgerInsert($requestId, $ticket->getId(), $staff->getId(), 'status_reserved');
             $this->dropOwnerDirty($ticket);
             $this->nativeLock($ticket, $staff);
-            $this->finishStatus($ticket, $staff, $status, $summary, $requestId);
+            $this->beginStatus($ticket, $staff, $status, $summary, $requestId);
         } catch (WgsReplyBridgeFault $ex) {
-            $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
+            $this->settleStatus($requestId);
         } catch (Throwable $ex) {
-            $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
+            $this->settleStatus($requestId);
         }
     }
 
@@ -298,14 +344,31 @@ class WgsReplyBridgePlugin extends Plugin {
         }
     }
 
-    function finishStatus($ticket, $staff, $status, $summary, $requestId) {
+    /**
+     * Persist the target, the prior status, and the note text, then call
+     * setStatus once. native_returned is written only after that call
+     * returns. A throw in between is status_state_unknown and is not retried
+     * as another setStatus.
+     */
+    function beginStatus($ticket, $staff, $status, $summary, $requestId) {
         $row = $this->ledgerFetch($requestId);
-        if (!$row || ($row['status'] !== 'status_reserved' && $row['status'] !== 'status_executing'))
+        if (!$row || $row['status'] !== 'status_reserved')
             $this->fail('already_done', 'This request id cannot be posted again.', 409);
-        if ($row['status'] === 'status_reserved') {
-            $this->ledgerMarkExecutingAs($requestId, $this->lastEntryId($ticket), 'status_reserved', 'status_executing');
-            $row = $this->ledgerFetch($requestId);
-        }
+
+        $priorId = (int) $ticket->getStatusId();
+        $noteText = $this->statusNoteText($staff, $status, $summary);
+        $expect = array(
+            'reply_sha256' => '',
+            'note_text' => $noteText,
+            'note_sha256' => $this->columnHash($this->expectedNoteColumn($noteText)),
+            'status_id' => (int) $status->getId(),
+            'require_reply' => false,
+        );
+        $intent = $this->statusFreshIntent($ticket, $staff, $status, $summary);
+        $intent['prior_status_id'] = $priorId;
+        $this->ledgerBeginNative(
+            $requestId, $this->lastEntryId($ticket), 'status_reserved', 'status_executing',
+            $intent, $expect);
 
         $this->reloadTicket($ticket);
         $this->dropOwnerDirty($ticket);
@@ -313,18 +376,60 @@ class WgsReplyBridgePlugin extends Plugin {
             $errors = array();
             // Empty comments: setStatus posts an alerted note when comments
             // are set. The bridge note below is the only one.
-            if (!$ticket->setStatus($status, '', $errors)) {
+            $ok = $ticket->setStatus($status, '', $errors);
+            // A false return finished the call. Store it and do not leave
+            // the row executing, or a retry would call setStatus again.
+            if (!$ok) {
                 $message = 'Unable to change the ticket status.';
                 if (!empty($errors['err']))
                     $message = (string) $errors['err'];
-                $this->fail('invalid_option', $message, 409);
+                $this->storeStatusRejected($requestId, $message);
             }
+            // The call returned true, but the ledger does not know that yet.
+            // This fault is that window: the status may already be saved.
+            if ($this->testFault() === 'status_interrupt')
+                throw new WgsReplyBridgeFault('status_interrupt');
+        } elseif ($this->testFault() === 'status_interrupt') {
+            throw new WgsReplyBridgeFault('status_interrupt');
         }
+        $this->ledgerMarkStatusNative($requestId);
+        $this->finishStatusNote($ticket, $requestId);
+    }
 
-        $noteText = $this->statusNoteText($staff, $status, $summary);
-        $noteId = ($row && $row['note_entry_id']) ? (int) $row['note_entry_id'] : 0;
+    function statusNativeReturned($row) {
+        if (!$row)
+            return false;
+        return (int) $row['native_returned'] === 1 || $row['status'] === 'status_applied';
+    }
+
+    /**
+     * setStatus already returned for this request id. Post the stored note
+     * if it is missing. Do not call setStatus.
+     */
+    function finishStatusNote($ticket, $requestId) {
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || !$this->statusNativeReturned($row))
+            $this->fail('already_done', 'This request id cannot be posted again.', 409);
+        $expect = $this->storedExpect($row);
+        if (!$expect)
+            $this->fail('request_id_reused',
+                'This request id was already used with different inputs.', 409);
+        $noteText = isset($expect['note_text']) ? (string) $expect['note_text'] : '';
+        if ($noteText === '')
+            $this->fail('request_id_reused',
+                'This request id was already used with different inputs.', 409);
+
+        $staffId = (int) $row['staff_id'];
+        $staff = Staff::lookup($staffId);
+        if (!$staff)
+            $this->fail('staff_not_found', 'Staff member was not found.', 404);
+
+        $noteId = $row['note_entry_id'] ? (int) $row['note_entry_id'] : 0;
         if (!$noteId) {
-            $note = $this->postStatusNote($ticket, $staff, $noteText);
+            if ($this->testFault() === 'note_fail')
+                $this->fail('partial_note_missing',
+                    'The status was saved but the internal note was not.', 500);
+            $note = $this->postExactNote($ticket, $staff, $noteText);
             $row = $this->ledgerFetch($requestId);
             if ($row && $row['note_entry_id'])
                 $noteId = (int) $row['note_entry_id'];
@@ -334,13 +439,8 @@ class WgsReplyBridgePlugin extends Plugin {
         if (!$noteId)
             $this->fail('partial_note_missing', 'The status was saved but the internal note was not.', 500);
 
-        $expect = array(
-            'reply_sha256' => '',
-            'note_sha256' => $this->columnHash($this->expectedNoteColumn($noteText)),
-            'status_id' => (int) $status->getId(),
-            'require_reply' => false,
-        );
-        $verification = $this->readVerification((int) $ticket->getId(), (int) $staff->getId(), 0, $noteId, $expect, false);
+        $verification = $this->readVerification(
+            (int) $ticket->getId(), $staffId, 0, $noteId, $expect, false);
         $this->reloadTicket($ticket);
         $statusNow = $ticket->getStatus();
         $payload = array(
@@ -354,6 +454,7 @@ class WgsReplyBridgePlugin extends Plugin {
             ),
             'verification' => $verification,
         );
+        $from = ($row && $row['status'] === 'status_applied') ? 'status_applied' : 'status_executing';
         if (empty($verification['all_passed'])) {
             $body = array(
                 'ok' => false,
@@ -364,15 +465,82 @@ class WgsReplyBridgePlugin extends Plugin {
                 'verification' => $verification,
             );
             $json = $this->encode($body);
-            $this->ledgerStoreResult($requestId, 'verification_failed', null, $noteId, $this->packResult($json, $expect), 'status_executing');
+            $this->ledgerStoreResult($requestId, 'verification_failed', null, $noteId, $this->packResult($json, $expect), $from);
             $this->respond(500, $json);
         }
         $json = $this->encode($payload);
-        $this->ledgerStoreResult($requestId, 'completed', null, $noteId, $this->packResult($json, $expect), 'status_executing');
+        $this->ledgerStoreResult($requestId, 'completed', null, $noteId, $this->packResult($json, $expect), $from);
         $saved = $this->ledgerFetch($requestId);
         if (!$saved || $saved['status'] !== 'completed')
             $this->fail('invalid_option', 'Unable to record the status change.', 500);
         $this->respond(200, $json);
+    }
+
+    /**
+     * The native call did not record a return. The ticket may or may not
+     * have changed. This request never calls setStatus again.
+     */
+    function storeStatusUnknown($requestId) {
+        $row = $this->ledgerFetch($requestId);
+        $done = $this->storedResult($row);
+        if ($done)
+            $this->respond($done[0], $done[1]);
+        $body = array(
+            'ok' => false,
+            'error' => 'status_state_unknown',
+            'message' => 'Whether this status change was saved is unknown. Check the ticket. This request will not change the status again.',
+            'response_entry_id' => null,
+        );
+        $json = $this->encode($body);
+        $this->ledgerStoreResult($requestId, 'status_state_unknown', null, null, $json, 'status_executing');
+        $saved = $this->ledgerFetch($requestId);
+        if ($saved && $saved['status'] === 'status_state_unknown' && $saved['result_json'])
+            $this->respond(500, $saved['result_json']);
+        $this->respond(500, $json);
+    }
+
+    /**
+     * setStatus returned false. The call is finished and is not repeated.
+     */
+    function storeStatusRejected($requestId, $message) {
+        $body = array(
+            'ok' => false,
+            'error' => 'invalid_option',
+            'message' => (string) $message,
+            'response_entry_id' => null,
+        );
+        $json = $this->encode($body);
+        $this->ledgerStoreResult($requestId, 'status_rejected', null, null, $json, 'status_executing');
+        $saved = $this->ledgerFetch($requestId);
+        if ($saved && $saved['result_json']) {
+            $done = $this->storedResult($saved);
+            if ($done)
+                $this->respond($done[0], $done[1]);
+        }
+        $this->respond(409, $json);
+    }
+
+    function settleStatus($requestId) {
+        $row = $this->ledgerFetch($requestId);
+        if (!$row)
+            $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
+        $done = $this->storedResult($row);
+        if ($done)
+            $this->respond($done[0], $done[1]);
+        if ($this->statusNativeReturned($row)) {
+            $ticket = Ticket::lookup((int) $row['ticket_id']);
+            if (!$ticket)
+                $this->fail('ticket_not_found', 'Ticket was not found.', 404);
+            try {
+                $this->finishStatusNote($ticket, $requestId);
+            } catch (Throwable $ex) {
+                $this->fail('partial_note_missing',
+                    'The status was saved but the internal note was not.', 500);
+            }
+        }
+        if ($row['status'] === 'status_executing')
+            $this->storeStatusUnknown($requestId);
+        $this->fail('invalid_option', 'Unable to change the ticket status.', 500);
     }
 
     function statusNoteText($staff, $status, $summary) {
@@ -380,7 +548,11 @@ class WgsReplyBridgePlugin extends Plugin {
             . (string) $staff->getName() . "\n\n" . $summary;
     }
 
-    function postStatusNote($ticket, $staff, $text) {
+    /**
+     * Post the note text that was stored before the native call. The
+     * caller decides note_fail. This does not rebuild the text.
+     */
+    function postExactNote($ticket, $staff, $text) {
         $errors = array();
         $this->connectCapture($ticket->getThreadId(), 'N');
         try {
@@ -530,7 +702,7 @@ class WgsReplyBridgePlugin extends Plugin {
             return '';
         $flag = (string) WGS_REPLY_BRIDGE_TEST_FAULTS;
         if ($flag === 'after_reply' || $flag === 'note_fail' || $flag === 'before_reply'
-                || $flag === 'verify_status')
+                || $flag === 'verify_status' || $flag === 'status_interrupt')
             return $flag;
         return '';
     }
@@ -634,12 +806,16 @@ class WgsReplyBridgePlugin extends Plugin {
             'default_close_status' => $this->defaultCloseStatus(),
             'can_close' => $this->canClose($ticket, $staff),
             'template' => $this->templateInfo($ticket, $staff, $this->defaultSignatureText($ticket, $staff)),
+            // Standalone status dialog. Not the reply form, so a staff
+            // member who cannot reply still gets the statuses they may set.
+            'status_choices' => $this->standaloneStatusChoices($ticket, $staff),
         );
         if ($block)
             $out['reason'] = $block['error'];
 
         // Choice lists are what the reply form would render. A staff member
         // who cannot open that form gets the ticket facts and empty lists.
+        // status_choices stays, because the status dialog does not need reply.
         if ($block && in_array($block['error'], array('no_access', 'no_reply_permission'), true))
             return $out;
 
@@ -742,6 +918,35 @@ class WgsReplyBridgePlugin extends Plugin {
             'options' => $options,
             'default' => (int) $ticket->getStatusId(),
         );
+    }
+
+    /**
+     * Statuses the staff status dialog would offer. Closed states need
+     * ticket.close and a closeable ticket. Open states need ticket.close
+     * or ticket.create (the reopen rule). Reply permission is not consulted.
+     * Deleted statuses are not offered.
+     */
+    function standaloneStatusChoices($ticket, $staff) {
+        $role = $ticket->getRole($staff);
+        $states = array();
+        if ($role && ($role->hasPerm(Ticket::PERM_CLOSE) || $role->hasPerm(Ticket::PERM_CREATE)))
+            $states[] = 'open';
+        if ($role && $role->hasPerm(Ticket::PERM_CLOSE) && $ticket->isCloseable() === true)
+            $states[] = 'closed';
+
+        $options = array();
+        if ($states) {
+            foreach (TicketStatusList::getStatuses(array('states' => $states)) as $s) {
+                if (!$s->isEnabled())
+                    continue;
+                $options[] = array(
+                    'id' => (int) $s->getId(),
+                    'name' => (string) $s->getName(),
+                    'state' => (string) $s->getState(),
+                );
+            }
+        }
+        return array('options' => $options);
     }
 
     /**
@@ -1572,29 +1777,10 @@ class WgsReplyBridgePlugin extends Plugin {
     }
 
     /**
-     * Spec rule 4. TextThreadEntryBody keeps the two lines and the blank
-     * line as text. alert is false. No note_status_id, so postNote does
-     * not call setStatus. No claim.
+     * Spec rule 4. The blank line stays. postExactNote posts this text
+     * with alerts off and without note_status_id, so postNote does not
+     * call setStatus.
      */
-    function postBridgeNote($ticket, $staff, $summary) {
-        // note_fail returns before postNote. The constant is the only switch.
-        if ($this->testFault() === 'note_fail')
-            return false;
-        $text = $this->noteText($staff, $summary);
-        $errors = array();
-        $this->connectCapture($ticket->getThreadId(), 'N');
-        try {
-            $note = $ticket->postNote(array(
-                'note' => new TextThreadEntryBody($text),
-            ), $errors, $staff, false);
-        } finally {
-            $this->disconnectCapture();
-        }
-        if ($note && $note->getId())
-            $this->ledgerCaptureNote($this->requestId(), (int) $note->getId());
-        return $note;
-    }
-
     function noteText($staff, $summary) {
         return 'Reply sent using Claude by ' . (string) $staff->getName()
             . "\n\n" . $summary;
@@ -1728,22 +1914,120 @@ class WgsReplyBridgePlugin extends Plugin {
         );
         $beforeRendered = $this->renderTemplateSide($ticket, $before, $variables);
         $afterRendered = $this->renderTemplateSide($ticket, $after, $variables);
-        $first = $this->recipientFirstName($ticket);
         $blob = $before . "\n" . $after;
-        $addsGreeting = (stripos($before, '%{recipient.name') !== false)
-            || (bool) preg_match('/\b(hi|hello|dear|hey)\b/i', $this->visiblePlain($before))
-            || $this->startsWithGreeting($this->visiblePlain($beforeRendered), $first);
-        $addsStaff = (stripos($blob, '%{poster') !== false)
-            || (stripos($blob, '%{staff') !== false);
+        $greeting = $this->greetingFlag($before, $beforeRendered, $ticket);
+        $staffName = $this->staffNameFlag($blob);
         $addsSignature = (stripos($blob, '%{signature') !== false);
         return array(
-            'adds_greeting' => $addsGreeting ? true : false,
-            'greeting_rendered' => $addsGreeting ? $beforeRendered : '',
-            'adds_staff_name' => $addsStaff ? true : false,
+            'adds_greeting' => $greeting['value'] ? true : false,
+            'greeting_rendered' => $greeting['value'] ? $beforeRendered : '',
+            'adds_staff_name' => $staffName['value'] ? true : false,
             'adds_signature' => $addsSignature ? true : false,
             'before_response_rendered' => $beforeRendered,
             'after_response_rendered' => $afterRendered,
+            'confidence' => array(
+                'adds_greeting' => $greeting['confidence'],
+                'adds_staff_name' => $staffName['confidence'],
+            ),
         );
+    }
+
+    /**
+     * adds_greeting is about the rendered text before %{response}, after
+     * tags and whitespace are stripped. It is true only when that text
+     * begins with Hi, Hello, Dear, Hey, or with a recipient-name value
+     * followed by a comma. A greeting word later in the sentence does not
+     * count. certain means the raw template begins the same way. likely
+     * means only the rendered text does.
+     */
+    function greetingFlag($beforeRaw, $beforeRendered, $ticket) {
+        $rawVisible = $this->visiblePlain($beforeRaw);
+        $renderedVisible = $this->visiblePlain($beforeRendered);
+        $rawCertain = (bool) preg_match('/^(hi|hello|dear|hey)\b/iu', $rawVisible)
+            || (bool) preg_match('/^%\{recipient\.name(?:\.[a-z0-9_]+)?\}\s*,/iu', $rawVisible);
+        $renderedStarts = $this->renderedStartsWithGreeting($renderedVisible, $ticket);
+        if ($renderedStarts && $rawCertain)
+            return array('value' => true, 'confidence' => 'certain');
+        if ($renderedStarts)
+            return array('value' => true, 'confidence' => 'likely');
+        return array('value' => false, 'confidence' => 'certain');
+    }
+
+    function renderedStartsWithGreeting($text, $ticket) {
+        if (preg_match('/^(hi|hello|dear|hey)\b/iu', (string) $text))
+            return true;
+        foreach ($this->recipientNameOutputs($ticket) as $name) {
+            if ($name === '')
+                continue;
+            if (preg_match('/^' . preg_quote($name, '/') . '\s*,/iu', (string) $text))
+                return true;
+        }
+        return false;
+    }
+
+    function recipientNameOutputs($ticket) {
+        $owner = $ticket->getOwner();
+        $names = array();
+        foreach (array(
+            '%{recipient.name}',
+            '%{recipient.name.first}',
+            '%{recipient.name.last}',
+            '%{recipient.name.full}',
+            '%{recipient.name.legal}',
+            '%{recipient.name.short}',
+            '%{recipient.name.formal}',
+            '%{recipient.name.shortformal}',
+            '%{recipient.name.complete}',
+            '%{recipient.name.original}',
+            '%{recipient.name.lastfirst}',
+        ) as $token) {
+            $rendered = $ticket->replaceVars($token, array('recipient' => $owner));
+            if (is_array($rendered))
+                $rendered = '';
+            $plain = $this->visiblePlain($rendered);
+            if ($plain !== '')
+                $names[$plain] = true;
+        }
+        return array_keys($names);
+    }
+
+    /**
+     * adds_staff_name is about variables that render the staff member's
+     * name. %{staff.phone}, email, and the other staff fields are not names.
+     * %{poster} and %{staff.name} (and PersonsName suffixes) are certain.
+     * A bare %{staff} is likely, because asVar is the name. An unknown
+     * name suffix is likely.
+     */
+    function staffNameFlag($raw) {
+        $certain = false;
+        $likely = false;
+        $suffixes = array(
+            'first', 'last', 'full', 'legal', 'lastfirst', 'formal',
+            'short', 'shortformal', 'complete', 'original',
+        );
+        if (preg_match_all('/\%\{([a-z0-9_.]+)\}/i', (string) $raw, $matches)) {
+            foreach ($matches[1] as $token) {
+                $token = strtolower($token);
+                if ($token === 'poster' || $token === 'poster.name' || $token === 'staff.name') {
+                    $certain = true;
+                    continue;
+                }
+                if (preg_match('/^(poster|staff)\.name\.([a-z0-9_]+)$/', $token, $part)) {
+                    if (in_array($part[2], $suffixes, true))
+                        $certain = true;
+                    else
+                        $likely = true;
+                    continue;
+                }
+                if ($token === 'staff')
+                    $likely = true;
+            }
+        }
+        if ($certain)
+            return array('value' => true, 'confidence' => 'certain');
+        if ($likely)
+            return array('value' => true, 'confidence' => 'likely');
+        return array('value' => false, 'confidence' => 'certain');
     }
 
     function renderTemplateSide($ticket, $text, array $variables) {
@@ -1872,77 +2156,67 @@ class WgsReplyBridgePlugin extends Plugin {
         return (int) db_result($res);
     }
 
-    function writeStatusId($ticketId, $statusId) {
-        $sql = 'UPDATE ' . TICKET_TABLE . ' SET status_id=' . db_input((int) $statusId)
-            . ' WHERE ticket_id=' . db_input((int) $ticketId);
-        db_query($sql);
-    }
-
-    function otherEnabledStatusId($current) {
-        foreach (TicketStatusList::getStatuses(array('states' => array('open', 'closed'))) as $status) {
-            if (!$status->isEnabled())
-                continue;
-            if ((int) $status->getId() !== (int) $current)
-                return (int) $status->getId();
-        }
-        return 0;
+    /**
+     * Fresh SQL read, then a pure comparison. The verify_status fault
+     * changes the in-memory snapshot only. It does not write the ticket.
+     * Reply keys are true when this call did not post a reply (the status
+     * route): all_passed then means the status and the note matched.
+     */
+    function readVerification($ticketId, $staffId, $responseId, $noteId, array $expect, $allowFault) {
+        $requireReply = !empty($expect['require_reply']);
+        $snapshot = array(
+            'status_id' => $this->ticketStatusIdFromDb($ticketId),
+            'staff_id' => (int) $staffId,
+            'reply' => ($requireReply && $responseId) ? $this->threadEntryRow($responseId) : null,
+            'note' => $noteId ? $this->threadEntryRow($noteId) : null,
+        );
+        if ($allowFault && $this->testFault() === 'verify_status')
+            $snapshot['status_id'] = (int) $expect['status_id'] + 1;
+        return $this->compareVerification($snapshot, $expect);
     }
 
     /**
-     * Fresh SQL read. Reply keys are true when this call did not post a
-     * reply (the status route): all_passed then means the status and the
-     * note matched. The verify_status fault changes status_id for this
-     * read only, then puts the original id back.
+     * Compare one read snapshot to the expectations stored before the
+     * native call. This does not read or write the ticket.
      */
-    function readVerification($ticketId, $staffId, $responseId, $noteId, array $expect, $allowFault) {
-        $restore = null;
-        if ($allowFault && $this->testFault() === 'verify_status') {
-            $current = $this->ticketStatusIdFromDb($ticketId);
-            $other = $this->otherEnabledStatusId($current);
-            if ($other && $other !== $current) {
-                $this->writeStatusId($ticketId, $other);
-                $restore = $current;
-            }
+    function compareVerification(array $snapshot, array $expect) {
+        $staffId = isset($snapshot['staff_id']) ? (int) $snapshot['staff_id'] : 0;
+        $statusActual = isset($snapshot['status_id']) ? (int) $snapshot['status_id'] : 0;
+        $requireReply = !empty($expect['require_reply']);
+        $reply = (isset($snapshot['reply']) && is_array($snapshot['reply'])) ? $snapshot['reply'] : null;
+        $note = (isset($snapshot['note']) && is_array($snapshot['note'])) ? $snapshot['note'] : null;
+        if ($requireReply) {
+            $replyRecorded = (bool) ($reply && strtoupper((string) $reply['type']) === 'R');
+            $replyByStaff = $replyRecorded && (int) $reply['staff_id'] === $staffId;
+            $replyHash = $reply ? $this->columnHash((string) $reply['body']) : '';
+            $expectReply = isset($expect['reply_sha256']) ? (string) $expect['reply_sha256'] : '';
+            $replyBodyMatches = $replyRecorded && strlen($expectReply) === 64
+                && strlen($replyHash) === 64 && hash_equals($expectReply, $replyHash);
+        } else {
+            $replyRecorded = true;
+            $replyByStaff = true;
+            $replyBodyMatches = true;
         }
-        try {
-            $statusActual = $this->ticketStatusIdFromDb($ticketId);
-            $requireReply = !empty($expect['require_reply']);
-            $reply = ($requireReply && $responseId) ? $this->threadEntryRow($responseId) : null;
-            $note = $noteId ? $this->threadEntryRow($noteId) : null;
-            if ($requireReply) {
-                $replyRecorded = (bool) ($reply && strtoupper((string) $reply['type']) === 'R');
-                $replyByStaff = $replyRecorded && (int) $reply['staff_id'] === (int) $staffId;
-                $replyHash = $reply ? $this->columnHash((string) $reply['body']) : '';
-                $replyBodyMatches = $replyRecorded
-                    && hash_equals((string) $expect['reply_sha256'], $replyHash);
-            } else {
-                // No reply was part of this call. Those checks are not failures.
-                $replyRecorded = true;
-                $replyByStaff = true;
-                $replyBodyMatches = true;
-            }
-            $noteRecorded = (bool) ($note && strtoupper((string) $note['type']) === 'N');
-            $noteHash = $note ? $this->columnHash((string) $note['body']) : '';
-            $noteExact = $noteRecorded && hash_equals((string) $expect['note_sha256'], $noteHash);
-            $statusExpected = (int) $expect['status_id'];
-            $statusMatches = ((int) $statusActual === $statusExpected);
-            $all = $replyRecorded && $replyByStaff && $replyBodyMatches
-                && $noteRecorded && $noteExact && $statusMatches;
-            return array(
-                'reply_recorded' => $replyRecorded ? true : false,
-                'reply_by_staff' => $replyByStaff ? true : false,
-                'reply_body_matches' => $replyBodyMatches ? true : false,
-                'note_recorded' => $noteRecorded ? true : false,
-                'note_text_exact' => $noteExact ? true : false,
-                'status_expected' => $statusExpected,
-                'status_actual' => (int) $statusActual,
-                'status_matches' => $statusMatches ? true : false,
-                'all_passed' => $all ? true : false,
-            );
-        } finally {
-            if ($restore !== null)
-                $this->writeStatusId($ticketId, $restore);
-        }
+        $noteRecorded = (bool) ($note && strtoupper((string) $note['type']) === 'N');
+        $noteHash = $note ? $this->columnHash((string) $note['body']) : '';
+        $expectNote = isset($expect['note_sha256']) ? (string) $expect['note_sha256'] : '';
+        $noteExact = $noteRecorded && strlen($expectNote) === 64
+            && strlen($noteHash) === 64 && hash_equals($expectNote, $noteHash);
+        $statusExpected = isset($expect['status_id']) ? (int) $expect['status_id'] : 0;
+        $statusMatches = ($statusActual === $statusExpected);
+        $all = $replyRecorded && $replyByStaff && $replyBodyMatches
+            && $noteRecorded && $noteExact && $statusMatches;
+        return array(
+            'reply_recorded' => $replyRecorded ? true : false,
+            'reply_by_staff' => $replyByStaff ? true : false,
+            'reply_body_matches' => $replyBodyMatches ? true : false,
+            'note_recorded' => $noteRecorded ? true : false,
+            'note_text_exact' => $noteExact ? true : false,
+            'status_expected' => $statusExpected,
+            'status_actual' => (int) $statusActual,
+            'status_matches' => $statusMatches ? true : false,
+            'all_passed' => $all ? true : false,
+        );
     }
 
     function packResult($json, array $expect) {
@@ -2043,6 +2317,41 @@ class WgsReplyBridgePlugin extends Plugin {
             $this->fail('already_done', 'This request id cannot be posted again.', 409);
     }
 
+    /**
+     * One update claims the native call and stores the intent and the
+     * expectations. A crash cannot leave `executing` without that plan.
+     */
+    function ledgerBeginNative($requestId, $baseline, $from, $to, array $intent, array $expect) {
+        $json = $this->encode(array(
+            'intent' => $intent,
+            'expect' => $expect,
+        ));
+        $sql = 'UPDATE ' . $this->ledgerTable()
+            . ' SET status=' . db_input($to)
+            . ', executing_at=' . db_input(time())
+            . ', baseline_entry_id=' . db_input((int) $baseline)
+            . ', result_json=' . db_input($json)
+            . ' WHERE request_id=' . db_input($requestId)
+            . ' AND status=' . db_input($from)
+            . ' AND (result_json IS NULL OR result_json=' . db_input('') . ')';
+        db_query($sql);
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || $row['status'] !== $to || !$this->storedIntent($row) || !$this->storedExpect($row))
+            $this->fail('already_done', 'This request id cannot be posted again.', 409);
+    }
+
+    function ledgerMarkStatusNative($requestId) {
+        $sql = 'UPDATE ' . $this->ledgerTable()
+            . ' SET status=' . db_input('status_applied')
+            . ', native_returned=1'
+            . ' WHERE request_id=' . db_input($requestId)
+            . ' AND status=' . db_input('status_executing');
+        db_query($sql);
+        $row = $this->ledgerFetch($requestId);
+        if (!$row || (int) $row['native_returned'] !== 1)
+            throw new WgsReplyBridgeFault('status_native');
+    }
+
     function ledgerComplete($requestId, $responseId, $noteId, $json) {
         $sql = 'UPDATE ' . $this->ledgerTable() . ' SET status=' . db_input('completed')
             . ', response_entry_id=' . db_input((int) $responseId)
@@ -2125,17 +2434,119 @@ class WgsReplyBridgePlugin extends Plugin {
                 (int) $row['staff_id']);
     }
 
+    function storedPlan($row) {
+        if (!$row || !isset($row['result_json']) || $row['result_json'] === '' || $row['result_json'] === null)
+            return null;
+        $decoded = json_decode((string) $row['result_json'], true);
+        if (!is_array($decoded))
+            return null;
+        return $decoded;
+    }
+
+    function storedIntent($row) {
+        $decoded = $this->storedPlan($row);
+        if (!$decoded || !isset($decoded['intent']) || !is_array($decoded['intent']))
+            return null;
+        return $decoded['intent'];
+    }
+
+    function storedExpect($row) {
+        $decoded = $this->storedPlan($row);
+        if (!$decoded || !isset($decoded['expect']) || !is_array($decoded['expect']))
+            return null;
+        return $decoded['expect'];
+    }
+
+    function storedNoteText($row) {
+        $expect = $this->storedExpect($row);
+        if (!$expect || !isset($expect['note_text']) || !is_string($expect['note_text']) || $expect['note_text'] === '')
+            return '';
+        return $expect['note_text'];
+    }
+
+    /**
+     * Inputs of this reply, as the first request sent them. An omitted
+     * reply_status_id stays null. It is not filled from the live ticket.
+     */
+    function replyFreshIntent(array $in, $ticket, $staff, $summary) {
+        $omitted = true;
+        $explicit = null;
+        if (array_key_exists('reply_status_id', $in)
+                && $in['reply_status_id'] !== null && $in['reply_status_id'] !== '') {
+            $explicit = (int) $in['reply_status_id'];
+            $omitted = false;
+        }
+        $html = (isset($in['response_html']) && is_string($in['response_html']))
+            ? $in['response_html'] : '';
+        return array(
+            'kind' => 'reply',
+            'ticket_id' => (int) $ticket->getId(),
+            'staff_id' => (int) $staff->getId(),
+            'response_sha256' => hash('sha256', $html),
+            'note_summary_sha256' => hash('sha256', (string) $summary),
+            'reply_status_id' => $omitted ? null : $explicit,
+        );
+    }
+
+    /**
+     * Inputs of this status change. prior_status_id is recorded on the
+     * stored intent and is not part of this comparison.
+     */
+    function statusFreshIntent($ticket, $staff, $status, $summary) {
+        return array(
+            'kind' => 'status',
+            'ticket_id' => (int) $ticket->getId(),
+            'staff_id' => (int) $staff->getId(),
+            'target_status_id' => (int) $status->getId(),
+            'summary_sha256' => hash('sha256', (string) $summary),
+        );
+    }
+
+    /**
+     * Keys present on the fresh intent must match the stored intent.
+     * Null stays null. It is not coerced to 0.
+     */
+    function sameIntent($stored, array $fresh) {
+        if (!is_array($stored))
+            return false;
+        foreach ($fresh as $key => $right) {
+            if (!array_key_exists($key, $stored))
+                return false;
+            $left = $stored[$key];
+            if ($left === null || $right === null) {
+                if ($left !== $right)
+                    return false;
+                continue;
+            }
+            if (is_int($right) || is_int($left)) {
+                if ((int) $left !== (int) $right)
+                    return false;
+                continue;
+            }
+            if ($left !== $right)
+                return false;
+        }
+        return true;
+    }
+
     /**
      * Completed is HTTP 200. A terminal failure is HTTP 500 and the same
-     * bytes on every retry. Anything still missing a result is not finished.
+     * bytes on every retry. status_rejected is HTTP 409. An in-progress
+     * plan has no HTTP body, so it is not a finished result.
      */
     function storedResult($row) {
         if (!$row || !isset($row['result_json']) || $row['result_json'] === '' || $row['result_json'] === null)
             return null;
         $body = (string) $row['result_json'];
         $decoded = json_decode($body, true);
-        // New rows wrap the HTTP bytes with the hashes a replay re-checks.
-        // Older rows, and mail-unknown rows, are the HTTP JSON itself.
+        // An in-progress plan is intent plus expect and has no HTTP body.
+        // reply_recorded_mail_unknown is set before that HTTP body is
+        // written, so a plan must not be returned as the stored result.
+        if (is_array($decoded) && isset($decoded['intent']) && !isset($decoded['body']))
+            return null;
+        // Finished rows wrap the HTTP bytes with the hashes a replay re-checks.
+        // Older rows, mail-unknown rows, and the two status terminals are
+        // the HTTP JSON itself.
         if (is_array($decoded) && isset($decoded['body']) && is_string($decoded['body'])
                 && isset($decoded['expect']) && is_array($decoded['expect']))
             $body = $decoded['body'];
@@ -2143,8 +2554,11 @@ class WgsReplyBridgePlugin extends Plugin {
             return array(200, $body);
         if ($row['status'] === 'reply_state_unknown'
                 || $row['status'] === 'reply_recorded_mail_unknown'
-                || $row['status'] === 'verification_failed')
+                || $row['status'] === 'verification_failed'
+                || $row['status'] === 'status_state_unknown')
             return array(500, $body);
+        if ($row['status'] === 'status_rejected')
+            return array(409, $body);
         return null;
     }
 
@@ -2498,14 +2912,15 @@ class WgsReplyBridgePlugin extends Plugin {
             }
             $this->completeSend($ticket, $response, $note, $requestId, $responseId);
         }
-        if (trim($summary) === '')
-            $this->fail('empty_summary', 'note_summary is required.', 400);
+        $noteText = $this->storedNoteText($row);
+        if ($noteText === '')
+            $this->fail('invalid_option', 'Unable to record this request.', 500);
         if ($this->testFault() === 'note_fail') {
             $this->fail('partial_note_missing',
                 'The reply was saved but the internal note was not.',
                 500, array('response_entry_id' => (int) $responseId));
         }
-        $note = $this->postBridgeNote($ticket, $staff, $summary);
+        $note = $this->postExactNote($ticket, $staff, $noteText);
         $row = $this->ledgerFetch($requestId);
         if ((!$note || !$note->getId()) && $row && $row['note_entry_id'])
             $note = $this->responseEntry($ticket, (int) $row['note_entry_id']);
@@ -2536,8 +2951,9 @@ class WgsReplyBridgePlugin extends Plugin {
         if ($noteId)
             $this->storeMailUnknownResult($requestId, $responseId, $noteId);
 
-        if (trim($summary) === '')
-            $this->fail('empty_summary', 'note_summary is required.', 400);
+        $noteText = $this->storedNoteText($row);
+        if ($noteText === '')
+            $this->fail('invalid_option', 'Unable to record this request.', 500);
         if ($this->testFault() === 'note_fail') {
             $this->fail('partial_note_missing',
                 'The reply was saved but the internal note was not.',
@@ -2546,7 +2962,7 @@ class WgsReplyBridgePlugin extends Plugin {
 
         $note = null;
         try {
-            $note = $this->postBridgeNote($ticket, $staff, $summary);
+            $note = $this->postExactNote($ticket, $staff, $noteText);
         } catch (Throwable $ex) {
             $note = null;
         }
@@ -2610,17 +3026,14 @@ class WgsReplyBridgePlugin extends Plugin {
         $staff = $staffId ? Staff::lookup($staffId) : null;
         if (!$staff)
             $this->fail('staff_not_found', 'Staff member was not found.', 404);
-        $clean = ($this->pendingClean === null) ? '' : (string) $this->pendingClean;
-        $expect = array(
-            'reply_sha256' => $this->columnHash($this->expectedReplyColumn($clean)),
-            'note_sha256' => $this->columnHash($this->expectedNoteColumn(
-                $this->noteText($staff, $this->pendingSummary))),
-            'status_id' => (int) ($this->pendingStatusId ? $this->pendingStatusId : $ticket->getStatusId()),
-            'require_reply' => true,
-        );
+        $expect = $this->storedExpect($row);
+        if (!$expect || !isset($expect['reply_sha256']) || $expect['reply_sha256'] === ''
+                || !isset($expect['note_sha256']) || !array_key_exists('status_id', $expect)
+                || empty($expect['require_reply']))
+            $this->fail('invalid_option', 'Unable to record this request.', 500);
         $noteId = (int) $note->getId();
-        // verify_status, when the staging constant names it, pokes the
-        // status around this read only. The ticket is restored before return.
+        // verify_status, when the staging constant names it, changes the
+        // in-memory snapshot only. The ticket row is not written.
         $verification = $this->readVerification(
             (int) $ticket->getId(), $staffId, (int) $responseId, $noteId, $expect, true);
         if (empty($verification['all_passed'])) {

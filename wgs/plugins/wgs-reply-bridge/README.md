@@ -144,12 +144,19 @@ Send order:
 2. Reject `no_access` and a missing ticket before any ticket payload.
 3. Take a MySQL advisory lock named `wgs_reply_<ticket_id>` (wait 10 seconds,
    refuse `busy` otherwise). Reload the ticket. Check the stored result again.
-4. Resume a row that already started, before the hash check. `reply_recorded`
-   with no note posts only the note. A captured response whose `postReply`
-   did not return normally posts the note if it is missing and returns
+4. Resume a row that already started, before the hash check. The retry's
+   ticket, staff, response HTML, note summary, and explicit `reply_status_id`
+   (null when it was omitted) must match the inputs stored before
+   `postReply`. A difference is `request_id_reused` (HTTP 409). The row is
+   left as it is, so the original inputs can still finish. An omitted status
+   is not filled in from the live ticket, so a later staff status change is
+   not a different request. `reply_recorded` with no note posts only the
+   stored note. A captured response whose `postReply` did not return
+   normally posts the stored note if it is missing and returns
    `mail_handoff_unknown`. `executing` with no response id becomes
    `reply_state_unknown`. Resume does not call `postReply`, and it does not
-   search the thread by staff, entry order, or note text.
+   search the thread by staff, entry order, or note text. A finished row
+   is not compared again: the stored bytes are returned as in step 1.
 5. Recompute the preview hash from live state and refuse `stale_preview` on
    any difference.
 6. Claim the request id as `reserved`, then `executing`, then acquire
@@ -209,17 +216,19 @@ names that cannot be projected. Codes include `auth_failed`, `ip_not_allowed`,
 `stale_preview`, `preview_unsupported`, `invalid_option`, `banned_owner`,
 `empty_response`, `empty_summary`, `already_done`, `partial_note_missing`,
 `reply_state_unknown`, `mail_handoff_unknown`, `verification_failed`,
-`no_change`, and `no_close_permission`. `no_access` and
+`no_change`, `no_close_permission`, `status_state_unknown`, and
+`request_id_reused`. `no_access` and
 `ticket_not_found` are returned before any ticket payload is built. That
 body is only `ok`, `error`, and `message`.
 
 `verification` is `{reply_recorded, reply_by_staff, reply_body_matches,
 note_recorded, note_text_exact, status_expected, status_actual,
 status_matches, all_passed}`. The reply and note checks compare a fresh SQL
-read to the sha256 of the column osTicket stored. The ledger keeps those
-hashes, not the message text. On a status change the reply checks are true
-because that call did not post a reply. `all_passed` then means the status
-and the note matched.
+read to the sha256 values stored before the native call. The block does not
+include the note text. On a status change the reply checks are true because
+that call did not post a reply. `all_passed` then means the status and the
+note matched. A retry verifies against those stored expectations. It does
+not rebuild them from the retry body or from the live ticket status.
 
 `options.default_close_status` is `{id, name}`. `options.can_close` is true
 when the acting agent's role has `ticket.close` and `Ticket::isCloseable()`
@@ -228,12 +237,26 @@ reply unless `reply_status_id` says so.
 
 `template` is computed from the department's live `ticket.reply` body,
 split at the first `%{response}`, with each side rendered by
-`Ticket::replaceVars`. `preview.warnings` is a list. It flags a response
-that starts with Hi, Hello, Dear, Hey, or the recipient's first name when
-the template already adds a greeting, a response that ends with the staff
-name or a sign-off when the template adds `%{poster}` or `%{staff}`, and a
-response that already contains the selected signature text. Warnings do not
-change the preview hash.
+`Ticket::replaceVars`. `adds_greeting` is true only when the rendered text
+before `%{response}` begins, after tags and whitespace are stripped, with
+Hi, Hello, Dear, Hey, or with the recipient's name followed by a comma.
+`adds_staff_name` is true for variables that render the staff member's
+name (`%{poster}`, `%{staff.name}`, and the name suffixes), not for
+`%{staff.phone}` or the other staff fields. `confidence` is `certain` or
+`likely` for each of those two flags. `preview.warnings` is a list. It
+flags a response that starts with Hi, Hello, Dear, Hey, or the recipient's
+first name when the template already adds a greeting, a response that ends
+with the staff name or a sign-off when the template adds the staff name,
+and a response that already contains the selected signature text. Warnings
+and these flags do not change the preview hash.
+
+`options.status_choices` lists the statuses the staff status dialog would
+offer for this agent and this ticket. Closed states need `ticket.close`
+and a closeable ticket. Open states need `ticket.close` or `ticket.create`.
+Reply permission is not required, so a staff member who cannot reply still
+receives `status_choices`. `statuses` stays the reply form's list and is
+empty when that form is not available. `no_access` is still only `ok`,
+`error`, and `message`.
 
 `POST /api/wgs-reply/status` uses the same permission checks as the staff
 status dialog. A closed target needs `ticket.close` and a closeable ticket.
@@ -249,9 +272,18 @@ Status set to <status name> using Claude by <staff full name>
 ```
 
 `summary` is required. The note is posted with alerts off and does not
-change status again. The same request id is idempotent. A second instance
-is its own IP list and its own secret. A request is accepted by the first
-enabled instance whose IP matches and whose secret matches the signature.
+change status again. The same request id is idempotent. The target status,
+the prior status, the summary hash, and the note text are stored before
+`setStatus`. `native_returned` is set only after that call returns. The
+note id is captured from `threadentry.created`, the same way a reply is.
+If the call does not record a return, the result is `status_state_unknown`
+(HTTP 500) and this request id never calls `setStatus` again, even after
+someone reopens the ticket. A retry returns that stored result. If the
+call returned and the note is missing, a retry posts only the note. A
+false return from `setStatus` is stored as `status_rejected` (HTTP 409)
+and is not tried again. A second instance is its own IP list and its own
+secret. A request is accepted by the first enabled instance whose IP
+matches and whose secret matches the signature.
 
 The ledger is a state machine. A row is never deleted once execution starts.
 
@@ -272,8 +304,18 @@ The ledger is a state machine. A row is never deleted once execution starts.
   has no `mail` field.
 - `verification_failed`: the reply or the status was saved, and a fresh read
   did not match. HTTP 500. This request is not sent again.
-- `status_reserved` and `status_executing`: the status route's own states.
-  A send does not resume them into `postReply`.
+- `status_reserved`: the status request id is claimed, and `setStatus` has
+  not been called.
+- `status_executing`: the intent and the note text are stored, and
+  `setStatus` has been entered. `native_returned` is still 0.
+- `status_applied`: `setStatus` returned. `native_returned` is 1. The note
+  may still be missing. A retry posts only that note.
+- `status_state_unknown`: `setStatus` did not record a return. HTTP 500.
+  This request will not call `setStatus` again.
+- `status_rejected`: `setStatus` returned false. HTTP 409. This request
+  will not call `setStatus` again.
+
+A send does not resume a status row into `postReply`.
 
 `partial_note_missing` means the reply is saved and the note is not. It is
 never reported as success. The same request id posts the note and then
@@ -283,9 +325,10 @@ The constant `WGS_REPLY_BRIDGE_TEST_FAULTS` is a staging switch. Production
 does not define it, and the installer never defines it. The only honored
 values are `after_reply` (thrown from the response listener after the row is
 saved), `before_reply` (thrown after the row is `executing` and before
-`postReply`), `note_fail` (the note is not posted), and `verify_status`
-(the fresh status read is forced to a different enabled status, then the
-original status id is written back). Anything else is ignored. A
+`postReply`), `note_fail` (the note is not posted), `verify_status` (the
+in-memory status snapshot is forced to a different id; the ticket row is
+not written), and `status_interrupt` (thrown after `setStatus` returns and
+before `native_returned` is stored). Anything else is ignored. A
 `test_fault` row in plugin config does nothing. `verify_status` does not
 run on a replay.
 
@@ -319,10 +362,10 @@ run on a replay.
   turned into attachments by osTicket when the reply is posted, not during
   preview.
 - The ledger stores the request id, the state, the entry ids,
-  `native_returned`, and the response JSON. A completed or
-  `verification_failed` row also stores the sha256 of the expected reply
-  column and the expected note column, plus the expected status id. It does
-  not store the secret, the signature, or the message body. A crash after the response row is
+  `native_returned`, and the response JSON. Before `postReply` or
+  `setStatus`, it also stores the note text, the sha256 of the reply
+  column, the sha256 of the note column, and the expected status id. It
+  does not store the secret or the reply HTML. A crash after the response row is
   saved leaves `reply_recorded_mail_unknown` (or `reply_recorded` when
   `postReply` had already returned). The same request id finishes the note
   when it is missing and does not post a second reply. A crash before the

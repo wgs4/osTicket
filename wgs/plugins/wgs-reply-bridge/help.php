@@ -35,7 +35,15 @@ function wgs_reply_bridge_help_html() {
 printf '%s' "$SECRET" | php include/plugins/wgs-reply-bridge/cli/set-secret.php INSTANCE_ID</pre>
 <p>The script stores the value through the field's own to_database, reads it back through a fresh config, and prints only lengths and readback_match (yes or no). It refuses to run unless PHP is the cli SAPI. A web request cannot use it.</p>
 <h4>MCP side</h4>
-<p>On the host that calls the bridge, put the matching secret in that process's .env. Do not commit the .env. staff_identities.json names the staff username each caller acts as. The mux identities file lists who may use the shared mux. Leave MCP_MUX_ALLOW_ANONYMOUS off so an unnamed caller cannot post as someone else. Each staff member has a personal key. Do not share one key across people.</p>
+<p>On the host that calls the bridge, set these variables in that process's .env. Do not commit the .env.</p>
+<ul>
+<li><strong>OSTICKET_BRIDGE_URL.</strong> Base URL of these routes.</li>
+<li><strong>OSTICKET_BRIDGE_SECRET.</strong> The same shared secret as this instance.</li>
+<li><strong>OSTICKET_BRIDGE_CONNECT_IP.</strong> Optional. Dial this IP and keep the URL hostname for TLS and the Host header.</li>
+<li><strong>OSTICKET_BRIDGE_TIMEOUT.</strong> Request timeout in seconds. The MCP default is 30.</li>
+<li><strong>OSTICKET_STAFF_IDENTITIES_FILE.</strong> JSON file that maps each caller to a staff username. The default file name is staff_identities.json.</li>
+</ul>
+<p>The mux in front of the MCP server reads three more names. <strong>MCP_MUX_IDENTITIES_FILE</strong> is the JSON file of named bearer tokens. <strong>MCP_MUX_TOKEN</strong> is the variable that holds the bearer token. Leave <strong>MCP_MUX_ALLOW_ANONYMOUS</strong> off. It must not be set to 1, or an unnamed caller can post as someone else. Each staff member has a personal key. Do not share one key across people.</p>
 <h4>How to test</h4>
 <p>Call POST /api/wgs-reply/options for a ticket the staff member can open. preview returns the rendered department template and a preview_hash. send posts the reply and the note, then returns verification.all_passed. POST /api/wgs-reply/status changes status and posts its own note. Replay the same X-WGS-Request-Id: the bridge re-checks the stored entry ids and does not post again.</p>
 <h4>Troubleshooting</h4>
