@@ -9,6 +9,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-SRC = "/Users/david/code/osTicket-reply-bridge/wgs/plugins/wgs-reply-bridge/"
+SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) + os.sep
 DST = "/Volumes/PRO-G40/Docker/osticket-staging/app/include/plugins/wgs-reply-bridge/"
 BASE = "http://127.0.0.1:8095"
 MAIL = "http://127.0.0.1:8025"
@@ -323,6 +324,7 @@ def main():
     check_10(staff, tickets["stale"])
     check_race(staff, tickets["race"])
     check_fault_after_reply(staff, tickets["fault_reply"])
+    check_mail_unknown_verification(staff, tickets["fault_reply"])
     check_fault_note(staff, tickets["fault_note"])
     check_recipients(staff, tickets["collab"])
     check_owner_stale(staff, tickets["owner"])
@@ -910,6 +912,71 @@ def check_fault_after_reply(staff, ticket):
     if problems:
         detail += "\n" + "\n".join(problems)
     record("12 interrupted native call is mail_handoff_unknown and the retry matches", not problems, detail)
+
+
+def check_mail_unknown_verification(staff, ticket):
+    before = ctl(["state", ticket["number"]])
+    before_mail = mail_index()
+    marker = "Bridge mail unknown %s" % uuid.uuid4().hex[:12]
+    summary = "Verification does not prove the customer was mailed."
+    fields = reply_body(staff, marker, summary, ticket)
+    preview = post("preview", {
+        "ticket_number": ticket["number"],
+        "staff_username": staff["username"],
+        "response_html": fields["response_html"],
+    })
+    problems = []
+    if preview["code"] != 200 or not (preview["json"] or {}).get("ok"):
+        record("39 mail-unknown result keeps verification and stays unknown", False,
+               "preview %s %s" % (preview["code"], preview["raw"][:400]))
+        return
+    fields["preview_hash"] = preview["json"]["preview_hash"]
+    sent = None
+    try:
+        ctl(["set-fault", "after_reply"])
+        sent = post("send", fields)
+    finally:
+        ctl(["set-fault", "off"])
+    if not sent or sent["code"] != 500 or (sent["json"] or {}).get("error") != "mail_handoff_unknown":
+        problems.append("send %s %s" % (
+            sent["code"] if sent else 0, (sent or {}).get("raw", "")[:500]))
+    else:
+        problems.extend(verification_problems((sent["json"] or {}).get("verification")))
+        retry = post("send", fields, rid=sent["rid"])
+        if retry["code"] != 500 or (retry["json"] or {}).get("error") != "mail_handoff_unknown":
+            problems.append("retry %s %s" % (retry["code"], retry["raw"][:500]))
+        else:
+            problems.extend(verification_problems((retry["json"] or {}).get("verification")))
+        after = ctl(["state", ticket["number"]])
+        if after["counts"]["R"] != before["counts"]["R"] + 1:
+            problems.append("R %s -> %s" % (before["counts"]["R"], after["counts"]["R"]))
+        if after["counts"]["N"] != before["counts"]["N"] + 1:
+            problems.append("N %s -> %s" % (before["counts"]["N"], after["counts"]["N"]))
+        owner = (ticket.get("owner_email") or "").lower()
+        hits = []
+        for message in new_messages(before_mail):
+            full = mail_full(message["ID"])
+            if owner and owner in addrs(full.get("To")) + addrs(full.get("Cc")):
+                hits.append(message["ID"])
+        if hits:
+            problems.append("mail arrived for an unknown handoff: %s" % hits)
+        ledger = ctl(["ledger", sent["rid"]])
+        if ledger.get("status") != "reply_recorded_mail_unknown":
+            problems.append("ledger %s" % ledger.get("status"))
+        legacy = ctl(["legacy-mail-unknown", sent["rid"]])
+        old = post("send", fields, rid=sent["rid"])
+        if old["code"] != 500 or old["raw"] != legacy.get("body"):
+            problems.append("legacy retry %s %s" % (old["code"], old["raw"][:400]))
+        elif (old["json"] or {}).get("error") != "mail_handoff_unknown":
+            problems.append("legacy error %r" % (old["json"] or {}).get("error"))
+        final = ctl(["state", ticket["number"]])
+        if final["counts"] != after["counts"]:
+            problems.append("legacy retry changed entries")
+    detail = "ticket %s" % ticket["number"]
+    if problems:
+        detail += "\n" + "\n".join(problems)
+        detail += "\n" + (sent or {}).get("raw", "")[:500]
+    record("39 mail-unknown result keeps verification and stays unknown", not problems, detail)
 
 
 def check_fault_note(staff, ticket):

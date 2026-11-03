@@ -2142,7 +2142,8 @@ class WgsReplyBridgePlugin extends Plugin {
             return null;
         $sql = 'SELECT id, type, staff_id, body, format FROM ' . THREAD_ENTRY_TABLE
             . ' WHERE id=' . db_input((int) $entryId);
-        if (!($res = db_query($sql)) || !($row = db_fetch_array($res)))
+        // No error log: a failed read must not write a syslog row or alert.
+        if (!($res = db_query($sql, false)) || !($row = db_fetch_array($res)))
             return null;
         return $row;
     }
@@ -2150,7 +2151,7 @@ class WgsReplyBridgePlugin extends Plugin {
     function ticketStatusIdFromDb($ticketId) {
         $sql = 'SELECT status_id FROM ' . TICKET_TABLE
             . ' WHERE ticket_id=' . db_input((int) $ticketId);
-        $res = db_query($sql);
+        $res = db_query($sql, false);
         if (!$res)
             return 0;
         return (int) db_result($res);
@@ -2234,7 +2235,9 @@ class WgsReplyBridgePlugin extends Plugin {
     /**
      * Re-read the stored ids. The new request body is not used. When the
      * verification block is unchanged, the original HTTP bytes are returned.
-     * When it differs, a new body is returned and nothing is posted.
+     * When it differs, a new body is returned and nothing is posted. A
+     * mail-unknown row stays mail_handoff_unknown even when every check
+     * passes: verification does not prove the customer was mailed.
      */
     function replayVerify($row, array $done) {
         $http = $done[0];
@@ -2261,6 +2264,11 @@ class WgsReplyBridgePlugin extends Plugin {
         if (!is_array($old))
             return array($http, $body);
         $old['verification'] = $verification;
+        if ($row['status'] === 'reply_recorded_mail_unknown') {
+            $old['ok'] = false;
+            $old['error'] = 'mail_handoff_unknown';
+            return array(500, $this->encode($old));
+        }
         if (!empty($verification['all_passed'])) {
             $old['ok'] = true;
             unset($old['error'], $old['message']);
@@ -2545,8 +2553,8 @@ class WgsReplyBridgePlugin extends Plugin {
         if (is_array($decoded) && isset($decoded['intent']) && !isset($decoded['body']))
             return null;
         // Finished rows wrap the HTTP bytes with the hashes a replay re-checks.
-        // Older rows, mail-unknown rows, and the two status terminals are
-        // the HTTP JSON itself.
+        // Older rows, including mail-unknown rows written before that shape,
+        // and the two status terminals are the HTTP JSON itself.
         if (is_array($decoded) && isset($decoded['body']) && is_string($decoded['body'])
                 && isset($decoded['expect']) && is_array($decoded['expect']))
             $body = $decoded['body'];
@@ -2981,7 +2989,20 @@ class WgsReplyBridgePlugin extends Plugin {
         $this->storeMailUnknownResult($requestId, $responseId, $noteId);
     }
 
+    /**
+     * The response and the note exist, but the native call did not say the
+     * mail was handed off. The stored result keeps the expectations so a
+     * replay can re-read the entries. A passing verification does not make
+     * this a success. Rows written before this shape have no expect and
+     * stay plain JSON.
+     */
     function storeMailUnknownResult($requestId, $responseId, $noteId) {
+        $row = $this->ledgerFetch($requestId);
+        $expect = $this->storedExpect($row);
+        if (!$expect || !isset($expect['reply_sha256']) || $expect['reply_sha256'] === ''
+                || !isset($expect['note_sha256']) || !array_key_exists('status_id', $expect)
+                || empty($expect['require_reply']))
+            $expect = null;
         $body = array(
             'ok' => false,
             'error' => 'mail_handoff_unknown',
@@ -2989,11 +3010,22 @@ class WgsReplyBridgePlugin extends Plugin {
             'response_entry_id' => (int) $responseId,
             'note_entry_id' => (int) $noteId,
         );
+        if ($expect) {
+            $body['verification'] = $this->readVerification(
+                (int) $row['ticket_id'],
+                (int) $row['staff_id'],
+                (int) $responseId,
+                (int) $noteId,
+                $expect,
+                false);
+        }
         $json = $this->encode($body);
-        $this->ledgerStoreResult($requestId, 'reply_recorded_mail_unknown', (int) $responseId, (int) $noteId, $json, 'reply_recorded_mail_unknown');
+        $stored = $expect ? $this->packResult($json, $expect) : $json;
+        $this->ledgerStoreResult($requestId, 'reply_recorded_mail_unknown', (int) $responseId, (int) $noteId, $stored, 'reply_recorded_mail_unknown');
         $row = $this->ledgerFetch($requestId);
-        if ($row && $row['result_json'])
-            $this->respond(500, $row['result_json']);
+        $done = $this->storedResult($row);
+        if ($done)
+            $this->respond($done[0], $done[1]);
         $this->respond(500, $json);
     }
 

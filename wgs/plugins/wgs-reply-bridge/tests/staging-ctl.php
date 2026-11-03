@@ -109,6 +109,9 @@ try {
     case 'ledger':
         bridge_out(bridge_ledger($argv[2]));
         break;
+    case 'legacy-mail-unknown':
+        bridge_out(bridge_legacy_mail_unknown($argv[2]));
+        break;
     case 'render-config':
         bridge_out(bridge_render_config());
         break;
@@ -886,6 +889,35 @@ function bridge_ledger($requestId) {
         'native_returned' => !empty($row['native_returned']) ? 1 : 0,
         'baseline_entry_id' => $row['baseline_entry_id'] !== null ? (int) $row['baseline_entry_id'] : null,
     );
+}
+
+/**
+ * Rewrite a reply_recorded_mail_unknown result to the plain JSON older
+ * code stored, with no expect wrapper, so a retry can prove it still
+ * replays the stored bytes.
+ */
+function bridge_legacy_mail_unknown($requestId) {
+    if (!preg_match('/^[A-Za-z0-9-]{36}$/', (string) $requestId))
+        bridge_fail('request id is not valid.');
+    $sql = 'SELECT response_entry_id, note_entry_id FROM `' . TABLE_PREFIX . 'wgs_reply_ledger`'
+        . ' WHERE request_id=' . db_input($requestId)
+        . ' AND status=' . db_input('reply_recorded_mail_unknown');
+    if (!($res = db_query($sql)) || !db_num_rows($res))
+        bridge_fail('No mail-unknown row with that request id.');
+    $row = db_fetch_array($res);
+    $body = json_encode(array(
+        'ok' => false,
+        'error' => 'mail_handoff_unknown',
+        'message' => 'legacy plain result',
+        'response_entry_id' => (int) $row['response_entry_id'],
+        'note_entry_id' => (int) $row['note_entry_id'],
+    ), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $update = 'UPDATE `' . TABLE_PREFIX . 'wgs_reply_ledger`'
+        . ' SET result_json=' . db_input($body)
+        . ' WHERE request_id=' . db_input($requestId);
+    if (!db_query($update))
+        bridge_fail('Could not rewrite the ledger result.');
+    return array('ok' => true, 'body' => $body);
 }
 
 /**
