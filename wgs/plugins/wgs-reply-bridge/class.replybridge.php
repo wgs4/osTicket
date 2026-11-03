@@ -2142,7 +2142,8 @@ class WgsReplyBridgePlugin extends Plugin {
             return null;
         $sql = 'SELECT id, type, staff_id, body, format FROM ' . THREAD_ENTRY_TABLE
             . ' WHERE id=' . db_input((int) $entryId);
-        if (!($res = db_query($sql)) || !($row = db_fetch_array($res)))
+        // No error log: a failed read must not write a syslog row or alert.
+        if (!($res = db_query($sql, false)) || !($row = db_fetch_array($res)))
             return null;
         return $row;
     }
@@ -2150,7 +2151,7 @@ class WgsReplyBridgePlugin extends Plugin {
     function ticketStatusIdFromDb($ticketId) {
         $sql = 'SELECT status_id FROM ' . TICKET_TABLE
             . ' WHERE ticket_id=' . db_input((int) $ticketId);
-        $res = db_query($sql);
+        $res = db_query($sql, false);
         if (!$res)
             return 0;
         return (int) db_result($res);
