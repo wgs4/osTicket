@@ -139,8 +139,10 @@ Send order:
    compare them to the stored hashes. When that block is unchanged, the
    original HTTP bytes are returned and the new body is not interpreted.
    When it differs, a new body is returned and nothing is sent again.
-   `reply_state_unknown` and `reply_recorded_mail_unknown` are HTTP 500 and
-   return the stored bytes without that re-read. `completed` is HTTP 200.
+   `reply_recorded_mail_unknown` re-reads the same way but keeps
+   `mail_handoff_unknown` and HTTP 500 even when every check passes.
+   `reply_state_unknown` is HTTP 500 and returns the stored bytes without
+   that re-read. `completed` is HTTP 200.
 2. Reject `no_access` and a missing ticket before any ticket payload.
 3. Take a MySQL advisory lock named `wgs_reply_<ticket_id>` (wait 10 seconds,
    refuse `busy` otherwise). Reload the ticket. Check the stored result again.
@@ -176,8 +178,10 @@ Send order:
 A `postReply` that saved a row and then threw, or that returned a different
 entry than the one captured, is `reply_recorded_mail_unknown`. The audit note
 is still posted. The result is `ok: false`, error `mail_handoff_unknown`,
-with both entry ids. A retry returns that stored result and does not send
-again. A call that captured no response id is `reply_state_unknown`. The
+with both entry ids and a fresh `verification` block. A retry re-reads the
+entry ids, returns fresh verification, and still reports
+`mail_handoff_unknown`; it never becomes a success and does not send again.
+A call that captured no response id is `reply_state_unknown`. The
 entry may already have been saved, because osTicket writes the row before
 it signals. The result says persistence and mail handoff are unknown, and
 that a saved reply is missing its `Reply sent using Claude` note, which
@@ -227,8 +231,9 @@ status_matches, all_passed}`. The reply and note checks compare a fresh SQL
 read to the sha256 values stored before the native call. The block does not
 include the note text. On a status change the reply checks are true because
 that call did not post a reply. `all_passed` then means the status and the
-note matched. A retry verifies against those stored expectations. It does
-not rebuild them from the retry body or from the live ticket status.
+note matched. A retry, including a mail-unknown retry, verifies against
+those stored expectations. It does not rebuild them from the retry body or
+from the live ticket status.
 
 `options.default_close_status` is `{id, name}`. `options.can_close` is true
 when the acting agent's role has `ticket.close` and `Ticket::isCloseable()`
